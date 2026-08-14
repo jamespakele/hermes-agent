@@ -209,3 +209,20 @@ class TestBannerUpdateCheckNonBlocking:
             done.set()
             time.sleep(0.3)
         assert not printed
+
+
+    def test_emit_notice_falls_back_to_console_without_prompt(self):
+        """Without a live prompt_toolkit app, _emit_update_notice must print
+        through the caller's console (the pre-fix path), so headless /
+        banner-only surfaces still get the notice."""
+        import hermes_cli.banner as banner
+
+        printed = []
+        class _Console:
+            def print(self, msg, *a, **k):
+                printed.append(msg)
+
+        with patch.object(banner, "_format_update_notice", return_value="1 commit behind"):
+            banner._emit_update_notice(_Console(), 1)
+        assert printed, "fallback console.print never called"
+        assert "1 commit behind" in printed[0]
