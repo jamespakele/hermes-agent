@@ -875,8 +875,23 @@ def sync_skills(quiet: bool = False) -> dict:
                     # shutil.move() nest dest *inside* it (or fail outright)
                     # and would poison the restore path below. The current
                     # dest is the authoritative copy — clear the leftover.
+                    #
+                    # The scope guard in _rmtree_writable raises ValueError
+                    # (NOT OSError/IOError) when a stale .bak sits outside the
+                    # current profile's SKILLS_DIR — e.g. an orphan left by a
+                    # profile that no longer owns the skill. We must tolerate
+                    # that here: a single unreachable leftover must not abort
+                    # the whole multi-skill sync. Move past it (the move below
+                    # is still safe — it targets dest, which IS in scope) and
+                    # let the orphan age out. Cleanup below also tolerates it.
                     if backup.exists():
-                        _rmtree_writable(backup)
+                        try:
+                            _rmtree_writable(backup)
+                        except (OSError, IOError, ValueError):
+                            logger.debug(
+                                "Could not clear stale backup %s", backup,
+                                exc_info=True,
+                            )
                     shutil.move(str(dest), str(backup))
                     try:
                         shutil.copytree(skill_src, dest)
@@ -887,7 +902,7 @@ def sync_skills(quiet: bool = False) -> dict:
                         # Remove backup after successful copy
                         try:
                             _rmtree_writable(backup)
-                        except (OSError, IOError):
+                        except (OSError, IOError, ValueError):
                             logger.debug("Could not remove backup %s", backup, exc_info=True)
                     except (OSError, IOError):
                         # Restore from backup. A partially-written dest must
@@ -897,7 +912,7 @@ def sync_skills(quiet: bool = False) -> dict:
                             if dest.exists():
                                 try:
                                     _rmtree_writable(dest)
-                                except (OSError, IOError):
+                                except (OSError, IOError, ValueError):
                                     logger.warning(
                                         "Could not clear partial copy %s during restore",
                                         dest, exc_info=True,
@@ -905,7 +920,7 @@ def sync_skills(quiet: bool = False) -> dict:
                             if not dest.exists():
                                 shutil.move(str(backup), str(dest))
                         raise
-                except (OSError, IOError) as e:
+                except (OSError, IOError, ValueError) as e:
                     if not quiet:
                         print(f"  ! Failed to update {skill_name}: {e}")
             else:
