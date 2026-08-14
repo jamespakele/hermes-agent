@@ -97,6 +97,57 @@ def _redact_reference_outputs(
     ]
 
 
+# Marker a reference advisor uses in its ADVICE TEXT when it hallucinates that
+# it executed a tool. References have NO tools — they cannot call, run, or
+# edit anything (see _REFERENCE_SYSTEM_PROMPT). So a "[called tool: ...]" line
+# in a reference's advisory output is by definition fabricated; it is NOT a
+# real execution. Left untouched, the aggregator can mistake it for evidence
+# the reference "edited a file / ran a command" and either blame the reference
+# for a corruption it never caused or treat a hallucinated action as fact.
+# We neutralize these lines before the advice reaches the aggregator (and the
+# display), replacing them with a marker that makes the fabrication explicit.
+# NOTE: this sanitizes reference OUTPUT only. The same marker legitimately
+# appears in the reference's INPUT view (the agent's real tool_calls rendered
+# by _render_tool_calls) and must NOT be stripped there.
+_REFERENCE_ACTION_MARKER = "[called tool:"
+_REFERENCE_ACTION_REPLACEMENT = "[claimed to call tool (reference has no tools; this action was NOT executed):"
+
+
+def _strip_fabricated_reference_actions(text: Any) -> Any:
+    """Neutralize fabricated ``[called tool: ...]`` claims in reference advice.
+
+    References are advisory-only and have no tool access, so any ``[called
+    tool:`` marker appearing in their OUTPUT text is a hallucinated claim that
+    the reference acted. Rewrite each such marker to state plainly that no
+    action was taken, so the aggregator (and user) can't mistake it for real
+    execution. Non-marker text is preserved verbatim. Accepts a non-str input
+    (e.g. ``None``) defensively and passes it through unchanged.
+    """
+    if not text:
+        return text
+    if _REFERENCE_ACTION_MARKER not in text:
+        return text
+    return text.replace(
+        _REFERENCE_ACTION_MARKER, _REFERENCE_ACTION_REPLACEMENT
+    )
+
+
+def _sanitize_reference_outputs(
+    reference_outputs: list[tuple[str, str, Any]],
+) -> list[tuple[str, str, Any]]:
+    """Strip fabricated tool-call claims from reference advisory text.
+
+    Applies ``_strip_fabricated_reference_actions`` to every reference's
+    advisory text, preserving the label and accounting slots. This runs on the
+    text destined for the AGGREGATOR and the DISPLAY — the cache keeps the raw
+    text so a privacy/sanitize mode change never double-processes it.
+    """
+    return [
+        (label, _strip_fabricated_reference_actions(text), acct)
+        for label, text, acct in reference_outputs
+    ]
+
+
 def _redact_trace_messages(messages: Any) -> Any:
     """Redact message copies destined for trace persistence.
 
@@ -2219,7 +2270,9 @@ class MoAChatCompletions:
                     index=_idx,
                     count=_ref_count,
                     label=_label,
-                    text=_redact_reference_text(_text) if privacy_mode else _text,
+                    text=_strip_fabricated_reference_actions(
+                        _redact_reference_text(_text) if privacy_mode else _text
+                    ),
                 )
             if _ref_count:
                 # Phase transition: reference fan-out is complete, the
@@ -2254,9 +2307,11 @@ class MoAChatCompletions:
             # refs are already filtered out; only successful advisor text is
             # joined (and redacted when requested).
             _agg_refs = (
-                _redact_reference_outputs(successful_outputs)
+                _sanitize_reference_outputs(
+                    _redact_reference_outputs(successful_outputs)
+                )
                 if privacy_mode == "full"
-                else successful_outputs
+                else _sanitize_reference_outputs(successful_outputs)
             )
             joined = "\n\n".join(
                 f"Reference {idx} — {label}:\n{text}"
