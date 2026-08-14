@@ -713,6 +713,59 @@ def _format_update_notice(behind: int) -> str:
 _deferred_update_notice_started = False
 
 
+def _emit_update_notice(console, behind: int) -> None:
+    """Emit the deferred update notice through a prompt-safe channel.
+
+    This runs on a background daemon thread while the interactive prompt may
+    already be live. A bare ``console.print()`` here writes raw ANSI escapes
+    directly to stdout from another thread, which races with prompt_toolkit's
+    prompt redraw and can leak literal escape bytes (e.g. ``?[1;33m``) into
+    the chat box. Route the print through prompt_toolkit's ``run_in_terminal``
+    on the app event loop instead, which hides the prompt, prints the line
+    above it, and redraws — the same mechanism ``cli._cprint`` uses. When no
+    interactive prompt is running (headless / banner-only surfaces), fall
+    back to the caller's ``console`` as before.
+    """
+    try:
+        from prompt_toolkit.application import get_app_or_none, run_in_terminal
+        from prompt_toolkit.formatted_text import ANSI as _PT_ANSI
+        from prompt_toolkit import print_formatted_text as _pt_print
+
+        app = get_app_or_none()
+        if app is not None and getattr(app, "_is_running", False):
+            text = _format_update_notice(behind)
+
+            def _schedule() -> None:
+                try:
+                    import asyncio as _aio
+                    import inspect as _inspect
+
+                    coro = run_in_terminal(lambda: _pt_print(_PT_ANSI(text)))
+                    if coro is not None and (
+                        _inspect.isawaitable(coro) or _inspect.iscoroutine(coro)
+                    ):
+                        _aio.ensure_future(coro)
+                except Exception:
+                    pass  # best-effort; the line may already have printed
+
+            loop = getattr(app, "loop", None)
+            if loop is not None:
+                try:
+                    loop.call_soon_threadsafe(_schedule)
+                    return
+                except Exception:
+                    pass  # fall through to console fallback below
+            try:
+                _pt_print(_PT_ANSI(text))
+                return
+            except Exception:
+                pass  # fall through to console fallback below
+    except Exception:
+        pass  # never break the session over an update notice
+
+    console.print(_format_update_notice(behind))
+
+
 def _defer_update_notice(console: "Console", max_wait: float = 30.0) -> None:
     """Print the update warning once the prefetched check completes.
 
@@ -731,7 +784,7 @@ def _defer_update_notice(console: "Console", max_wait: float = 30.0) -> None:
             behind = _update_result
             if behind is None or behind == 0:
                 return
-            console.print(_format_update_notice(behind))
+            _emit_update_notice(console, behind)
         except Exception:
             pass  # never break the session over an update notice
 
