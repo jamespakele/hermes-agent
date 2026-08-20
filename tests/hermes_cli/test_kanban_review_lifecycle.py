@@ -708,3 +708,62 @@ def test_reviewer_reassigns_for_autonomous_dispatch(kanban_home: Path) -> None:
         ev = _events(conn, tid, kind="review_requested")[0][1]
         assert ev["reviewer"] == "lead-reviewer"
         assert ev["implementer"] == "worker"
+
+
+# ---------------------------------------------------------------------------
+# review-lane assignee gate: real profile dir vs skill name
+# ---------------------------------------------------------------------------
+
+
+def test_review_dispatch_claims_assignee_with_real_profile_dir(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A review-task assignee that maps to a real profile directory (the
+    dedicated reviewer profiles ai-knowledge-review / ai-code-review) is
+    claimed and spawned by the review lane — NOT bucketed
+    ``skipped_nonspawnable``. Exercises the REAL ``profile_exists`` dir
+    check (no ``all_assignees_spawnable`` fixture here)."""
+    import hermes_cli.config as cfgmod
+
+    # Real profile dir under the fixture's temp profiles root.
+    (kanban_home / "profiles" / "reviewer").mkdir(parents=True)
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="review me", assignee="worker")
+        impl = kb.claim_task(conn, tid)
+        assert impl is not None
+        assert kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer",
+            expected_run_id=impl.current_run_id,
+        )
+        res = kb.dispatch_once(conn, dry_run=True)
+    assert tid in [s[0] for s in res.spawned]
+    assert tid not in res.skipped_nonspawnable
+
+
+def test_review_dispatch_skips_skill_name_assignee(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reviewer that is a skill name (ai-knowledge-review) rather than a
+    profile directory is bucketed ``skipped_nonspawnable`` — no reviewer
+    worker spawns and the card stays parked in ``review``."""
+    import hermes_cli.config as cfgmod
+
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="review me", assignee="worker")
+        impl = kb.claim_task(conn, tid)
+        assert impl is not None
+        assert kb.request_review(
+            conn, tid, summary="ready", reviewer="ai-knowledge-review",
+            expected_run_id=impl.current_run_id,
+        )
+        res = kb.dispatch_once(conn, dry_run=True)
+    assert tid in res.skipped_nonspawnable
+    assert tid not in [s[0] for s in res.spawned]
