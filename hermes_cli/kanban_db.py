@@ -5402,6 +5402,88 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+# Review-gate enforcement (Option A). Cards carrying a review-required skill
+# must pass through the review lane (request-review -> reviewer approval)
+# before they may go ``done`` — UNLESS they have a pre-created QA/verification
+# child (e.g. a smoke-test card), in which case that child IS the gate and a
+# direct completion is allowed so the child lane is released.
+_REVIEW_REQUIRED_SKILLS = frozenset({"omp-with-advisor", "omp-plan-execute"})
+_QA_CHILD_KEYWORDS = ("smoke", "test", "verify", "qa", "review", "validate", "check")
+
+
+class ReviewGateNotSatisfiedError(ValueError):
+    """Raised by ``complete_task`` when a review-required card that never hit
+    ``request_review`` and has no QA/verification child is completed directly.
+
+    Use ``force=True`` (or the CLI ``--force`` flag) to bypass for a
+    legitimate manual/emergency completion.
+    """
+
+
+def _has_review_required_skill(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True if the task carries a review-required skill (omp-with-advisor etc)."""
+    row = conn.execute(
+        "SELECT skills FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if not row or not row["skills"]:
+        return False
+    try:
+        skills = json.loads(row["skills"])
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return any(s in _REVIEW_REQUIRED_SKILLS for s in (skills or []))
+
+
+def _ever_requested_review(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True if the task ever produced a ``review_requested`` event."""
+    return conn.execute(
+        "SELECT 1 FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_requested' LIMIT 1",
+        (task_id,),
+    ).fetchone() is not None
+
+
+def _has_qa_child(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True if the task has a child that serves as the verification gate.
+
+    A QA/verification child is one carrying the ``sdlc-review`` skill, or
+    whose title/body signals a smoke/test/verify role. Such a child IS the
+    review gate, so the parent may complete directly to release its lane.
+    """
+    rows = conn.execute(
+        "SELECT c.skills, c.title, c.body FROM task_links l "
+        "JOIN tasks c ON c.id = l.child_id WHERE l.parent_id = ?",
+        (task_id,),
+    ).fetchall()
+    for r in rows:
+        if r["skills"]:
+            try:
+                skills = json.loads(r["skills"])
+                if any(s == "sdlc-review" for s in (skills or [])):
+                    return True
+            except (json.JSONDecodeError, TypeError):
+                pass
+        blob = f"{(r['title'] or '')} {(r['body'] or '')}".lower()
+        if any(kw in blob for kw in _QA_CHILD_KEYWORDS):
+            return True
+    return False
+
+
+def _review_gate_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True if the card may complete under the review gate.
+
+    A card is exempt when it has no review-required skill, OR it already went
+    through review, OR it has a QA/verification child that serves as its gate.
+    """
+    if not _has_review_required_skill(conn, task_id):
+        return True
+    if _ever_requested_review(conn, task_id):
+        return True
+    if _has_qa_child(conn, task_id):
+        return True
+    return False
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5412,6 +5494,7 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    force: bool = False,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
@@ -5452,6 +5535,25 @@ def complete_task(
     # 'review' and cannot be approved until the follow-up's work exists.
     if not _parents_satisfied(conn, task_id) and not _is_followup(conn, task_id):
         return False
+
+    # Review-gate enforcement (Option A): a review-required card must pass
+    # through review (or have a QA/verification child that serves as its gate)
+    # before a direct completion is allowed. ``force=True`` (or CLI --force)
+    # bypasses for a legitimate manual/emergency completion.
+    if not force and not _review_gate_satisfied(conn, task_id):
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "completion_blocked_review_gate",
+                {
+                    "reason": "review-required skill, no review_requested event, "
+                              "and no QA/verification child",
+                },
+            )
+        raise ReviewGateNotSatisfiedError(
+            f"Task {task_id} carries a review-required skill but never passed "
+            f"through review and has no QA/verification child. Use force=True "
+            f"or the CLI --force flag to bypass."
+        )
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a

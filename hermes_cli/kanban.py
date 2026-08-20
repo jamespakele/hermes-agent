@@ -617,7 +617,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                  "Falls back to --result if omitted.")
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
-                                 '"tests_run": 12}\'). Stored on the closing run.')
+                                 '\'"tests_run": 12}\'). Stored on the closing run.')
+    p_complete.add_argument("--force", action="store_true",
+                            help="Bypass review-gate enforcement (manual/emergency completion)")
 
     p_edit = sub.add_parser(
         "edit",
@@ -2322,13 +2324,22 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 continue
 
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                ok = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                    force=getattr(args, "force", False),
+                )
+            except kb.ReviewGateNotSatisfiedError as exc:
+                failed.append(tid)
+                print(f"kanban: review gate not satisfied for {tid}: {exc}", file=sys.stderr)
+                print(f"  → Run the review: hermes kanban request-review {tid} --reviewer <profile>", file=sys.stderr)
+                print(f"  → Or bypass with: hermes kanban complete {tid} --force", file=sys.stderr)
+                continue
+            if not ok:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
