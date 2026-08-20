@@ -132,6 +132,14 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # spirit (default 2) but counts a different signal: manual unblock recurrences,
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
+
+# Priority threshold that marks a card as a review follow-up. Follow-up
+# cards (created by a reviewer after a CONCERNS/FAIL verdict) must execute
+# NEXT — before any other ready work — because the process is not complete
+# until QA/Review passes. The dispatcher already orders ready tasks by
+# priority DESC, so a follow-up with this priority is picked up first.
+FOLLOWUP_PRIORITY = 1000
+
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 
@@ -4559,6 +4567,21 @@ def recompute_ready(
                     {"status": resume_status} if resume_status != "ready" else None,
                 )
                 promoted += 1
+            elif _is_followup(conn, task_id):
+                # Follow-up child of a review parent: promote so it
+                # executes NEXT — the process is not complete until the
+                # follow-up passes.
+                cur = conn.execute(
+                    "UPDATE tasks SET status = 'ready' "
+                    "WHERE id = ? AND status = 'todo'",
+                    (task_id,),
+                )
+                if cur.rowcount == 1:
+                    _append_event(
+                        conn, task_id, "promoted",
+                        {"status": "ready", "reason": "followup_execute_next"},
+                    )
+                    promoted += 1
     return promoted
 
 
@@ -4575,6 +4598,33 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
         "AND p.status NOT IN ('done', 'archived') LIMIT 1",
         (task_id,),
     ).fetchone() is None
+
+
+def _is_followup(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True iff task_id is a review follow-up: priority at/above
+    FOLLOWUP_PRIORITY AND every open parent is in 'review'.
+
+    This is the scoped exemption to the parent-completion invariant
+    (RCA task t_a6acd07d): a follow-up child of a review parent may run
+    before the parent is done, because the process is not complete until
+    QA/Review passes. Any other shape (no open parents, a parent in
+    running/todo/blocked/ready) is NOT a follow-up and keeps the normal
+    gate.
+    """
+    t = conn.execute(
+        "SELECT priority FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if not t or int(t["priority"] or 0) < FOLLOWUP_PRIORITY:
+        return False
+    parents = conn.execute(
+        "SELECT p.status FROM task_links l "
+        "JOIN tasks p ON p.id = l.parent_id "
+        "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived')",
+        (task_id,),
+    ).fetchall()
+    if not parents:
+        return False  # no open parents -> normal claim rules apply
+    return all(p["status"] == "review" for p in parents)
 
 
 def claim_task(
@@ -4607,7 +4657,10 @@ def claim_task(
             "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
             (task_id,),
         ).fetchone()
-        if undone:
+        # A review follow-up (see _is_followup) is the scoped exception: its
+        # parent sits in 'review' and cannot be approved until the follow-up
+        # runs, so claiming it early is the intent, not an invariant break.
+        if undone and not _is_followup(conn, task_id):
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready'",
@@ -5357,8 +5410,10 @@ def complete_task(
     """
     now = int(time.time())
     # Fail before validating cards or staging artifacts; re-check inside the
-    # final write transaction below to close the parent-reopen race.
-    if not _parents_satisfied(conn, task_id):
+    # final write transaction below to close the parent-reopen race. A review
+    # follow-up (see _is_followup) is the scoped exemption: its parent sits in
+    # 'review' and cannot be approved until the follow-up's work exists.
+    if not _parents_satisfied(conn, task_id) and not _is_followup(conn, task_id):
         return False
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
@@ -5394,8 +5449,9 @@ def complete_task(
     with write_txn(conn):
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
-        # ``review`` or ``running``.
-        if not _parents_satisfied(conn, task_id):
+        # ``review`` or ``running``. Scoped exemption: a review follow-up may
+        # complete while its parent waits in 'review'.
+        if not _parents_satisfied(conn, task_id) and not _is_followup(conn, task_id):
             return False
         prior = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
@@ -6537,6 +6593,7 @@ def request_changes(
     *,
     reason: str,
     expected_run_id: Optional[int] = None,
+    priority: Optional[int] = None,
 ) -> tuple[bool, Optional[str]]:
     """Finish an active review run and route the task back for rework.
 
@@ -6545,6 +6602,11 @@ def request_changes(
     ``review_requested`` event, reapplies parent gating, and emits an auditable
     ``changes_requested`` event.  The second tuple item is the implementer on
     success or a diagnostic reason on failure.
+
+    ``priority`` re-queues the card so the rework executes NEXT (before other
+    ready work): ``None`` (default) bumps to ``FOLLOWUP_PRIORITY``; an explicit
+    value is applied via ``MAX(priority, N)`` so a card's priority is never
+    lowered. Pass ``0`` to keep the current priority unchanged.
     """
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
@@ -6610,6 +6672,9 @@ def request_changes(
             reviewer = None
 
         new_status = _landing_status_after_parents(conn, task_id)
+        # Reopened work executes NEXT: bump the card's priority so the
+        # dispatcher's priority DESC ready lane picks it before other work.
+        effective_priority = FOLLOWUP_PRIORITY if priority is None else int(priority)
         # NOTE: consecutive_failures is deliberately PRESERVED (neither
         # reset nor incremented). Review transitions are not evidence the
         # pathology cleared — only complete_task's success path resets the
@@ -6619,12 +6684,13 @@ def request_changes(
             UPDATE tasks
                SET status = ?,
                    assignee = COALESCE(?, assignee),
+                   priority = MAX(COALESCE(priority, 0), ?),
                    claim_lock = NULL,
                    claim_expires = NULL,
                    worker_pid = NULL
              WHERE id = ? AND status = 'running' AND current_run_id = ?
             """,
-            (new_status, implementer, task_id, int(current_run_id)),
+            (new_status, implementer, effective_priority, task_id, int(current_run_id)),
         )
         if cur.rowcount != 1:
             return False, "task changed during review handoff"
@@ -6644,6 +6710,7 @@ def request_changes(
                 "implementer": implementer,
                 "reviewer": reviewer,
                 "status": new_status,
+                "priority": effective_priority,
             },
             run_id=run_id,
         )

@@ -156,12 +156,23 @@ def _check_dispatcher_presence(
     be running under a different HERMES_HOME than the profile the request
     targets, which otherwise produced a "no gateway is running" warning
     against a perfectly healthy profile gateway (#71211). CLI callers leave
-    it ``None`` and keep the existing process-level behavior.
+    it ``None`` and the probe targets ``kanban_db.kanban_home()`` — the
+    shared board root that anchors the dispatcher gateway (under
+    ``--profile X`` the CLI process home is the profile dir, which has no
+    gateway of its own).
     """
     try:
         from gateway.status import resolve_gateway_liveness  # type: ignore
     except Exception:
         return (True, "")  # can't probe — silent
+    # CLI callers leave hermes_home=None. Scope the probe to the kanban
+    # board root — kanban_db.kanban_home() is the exact anchor the
+    # dispatcher gateway uses (honors HERMES_KANBAN_HOME override).
+    # Under `--profile X` the CLI process home is <root>/profiles/X,
+    # which has no gateway of its own; the shared board is dispatched
+    # by the root gateway at <root>/gateway.pid. Dashboard callers pass
+    # an explicit hermes_home and keep that scope.
+    probe_dir = hermes_home if hermes_home is not None else kb.kanban_home()
     try:
         # Same shared ladder the dashboard status endpoints use, so a
         # PID-file-less (launch-service-managed) or cross-container gateway
@@ -169,7 +180,7 @@ def _check_dispatcher_presence(
         # CLI/create-time probe, not a polling loop, and it must observe the
         # gateway's state right now rather than a cached snapshot.
         liveness = resolve_gateway_liveness(
-            profile_dir=hermes_home, use_cache=False
+            profile_dir=probe_dir, use_cache=False
         )
     except Exception:
         return (True, "")  # probe errored — silent
@@ -344,6 +355,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "deterministic branch. See `hermes project list`.")
     p_create.add_argument("--tenant", default=None, help="Tenant namespace")
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
+    p_create.add_argument(
+        "--followup", action="store_true",
+        help="Mark the card as a review follow-up: it executes NEXT (before "
+             "other ready work) and is claimable while its parent sits in "
+             "review. Sets priority to FOLLOWUP_PRIORITY (1000) unless "
+             "--priority is higher, and prefixes the title with '[FOLLOW-UP] '.",
+    )
     p_create.add_argument("--triage", action="store_true",
                           help="Park in triage — a specifier will flesh out the spec and promote to todo")
     p_create.add_argument("--idempotency-key", default=None,
@@ -687,6 +705,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_request_changes.add_argument("task_id")
     p_request_changes.add_argument(
         "reason", nargs="+", help="Concrete changes required before re-review",
+    )
+    p_request_changes.add_argument(
+        "--priority", type=int, default=None, metavar="N",
+        help="Bump the card's priority to N so rework executes next "
+             "(default: 1000, the follow-up threshold). Pass 0 to keep "
+             "the current priority.",
     )
 
     p_reopen_review = sub.add_parser(
@@ -1562,10 +1586,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    title = args.title
+    priority = args.priority
+    if getattr(args, "followup", False):
+        if not title.startswith("[FOLLOW-UP] "):
+            title = f"[FOLLOW-UP] {title}"
+        priority = max(priority, kb.FOLLOWUP_PRIORITY)
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
-            title=args.title,
+            title=title,
             body=args.body,
             assignee=args.assignee,
             created_by=args.created_by or _profile_author(),
@@ -1574,7 +1604,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             branch_name=branch_name,
             project_id=getattr(args, "project", None),
             tenant=args.tenant,
-            priority=args.priority,
+            priority=priority,
             parents=tuple(args.parent or ()),
             triage=bool(getattr(args, "triage", False)),
             idempotency_key=getattr(args, "idempotency_key", None),
@@ -2478,6 +2508,7 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
             tid,
             reason=reason,
             expected_run_id=_worker_run_id_for(tid),
+            priority=getattr(args, "priority", None),
         )
         if not ok:
             print(
