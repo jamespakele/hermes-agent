@@ -21,6 +21,7 @@ down:
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -767,3 +768,145 @@ def test_review_dispatch_skips_skill_name_assignee(
         res = kb.dispatch_once(conn, dry_run=True)
     assert tid in res.skipped_nonspawnable
     assert tid not in [s[0] for s in res.spawned]
+
+# ---------------------------------------------------------------------------
+# dispatch-time guard: non-existent reviewer/assignee profile
+# ---------------------------------------------------------------------------
+
+
+def _make_review_card(conn, reviewer: str) -> str:
+    """Create a ``ready -> review`` card whose reviewer is ``reviewer``."""
+    tid = kb.create_task(conn, title="review me", assignee="worker")
+    impl = kb.claim_task(conn, tid)
+    assert impl is not None
+    assert kb.request_review(
+        conn, tid, summary="ready", reviewer=reviewer,
+        expected_run_id=impl.current_run_id,
+    )
+    return tid
+
+
+def _enable_review_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    import hermes_cli.config as cfgmod
+
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+
+
+_MISSING_PROFILE_MARKER = "auto-dispatch: missing reviewer/assignee profile"
+
+
+def test_review_misassigned_profile_is_loud(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A review card whose reviewer names a non-existent profile is NOT
+    silently parked in ``skipped_nonspawnable`` — it lands in the
+    operator-actionable ``skipped_misassigned`` bucket (dry-run)."""
+    _enable_review_dispatch(monkeypatch)
+    with kb.connect() as conn:
+        tid = _make_review_card(conn, "nonexistent-reviewer")
+        res = kb.dispatch_once(conn, dry_run=True)
+    assert (tid, "nonexistent-reviewer") in res.skipped_misassigned
+    assert tid not in res.skipped_nonspawnable
+
+
+def test_review_misassigned_posts_comment_and_blocks(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The loud path posts an explanatory comment on the card and blocks it
+    (``needs_input``) so a human must intervene."""
+    _enable_review_dispatch(monkeypatch)
+    with kb.connect() as conn:
+        tid = _make_review_card(conn, "ghost-reviewer")
+        res = kb.dispatch_once(conn, dry_run=False)
+        assert (tid, "ghost-reviewer") in res.skipped_misassigned
+        comments = kb.list_comments(conn, tid)
+        assert any(_MISSING_PROFILE_MARKER in c.body for c in comments)
+        row = _row(conn, tid)
+        assert row["status"] == "blocked"
+        assert row["block_kind"] == "needs_input"
+
+
+def test_review_misassigned_logs_error(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The dispatcher logs an ERROR naming the card and the missing
+    profile — even in dry-run."""
+    _enable_review_dispatch(monkeypatch)
+    with kb.connect() as conn:
+        tid = _make_review_card(conn, "missing-profile")
+        with caplog.at_level(logging.ERROR, logger="hermes_cli.kanban_db"):
+            kb.dispatch_once(conn, dry_run=True)
+    assert any(
+        tid in rec.getMessage() and "missing-profile" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+def test_misassigned_idempotent_no_comment_spam(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repeated dispatch ticks on the same mis-assigned card post exactly
+    one marker comment."""
+    _enable_review_dispatch(monkeypatch)
+    with kb.connect() as conn:
+        tid = _make_review_card(conn, "ghost-reviewer")
+        kb.dispatch_once(conn, dry_run=False)
+        kb.dispatch_once(conn, dry_run=False)
+        comments = kb.list_comments(conn, tid)
+        markers = [
+            c for c in comments if _MISSING_PROFILE_MARKER in c.body
+        ]
+        assert len(markers) == 1
+
+
+def test_review_valid_profile_dispatches_normally(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A review card assigned to a real profile directory still dispatches
+    normally — the guard only fires for genuinely missing profiles."""
+    _enable_review_dispatch(monkeypatch)
+    (kanban_home / "profiles" / "test-reviewer").mkdir(parents=True)
+    with kb.connect() as conn:
+        tid = _make_review_card(conn, "test-reviewer")
+        res = kb.dispatch_once(conn, dry_run=True)
+    assert tid in [s[0] for s in res.spawned]
+    assert tid not in res.skipped_nonspawnable
+    assert tid not in [m[0] for m in res.skipped_misassigned]
+
+
+def test_ready_control_plane_lane_stays_quiet(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ready card on a known control-plane lane (orion-cc) stays in the
+    silent ``skipped_nonspawnable`` bucket — NOT flagged as an operator
+    error."""
+    _enable_review_dispatch(monkeypatch)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="terminal lane", assignee="orion-cc")
+        res = kb.dispatch_once(conn, dry_run=True)
+    assert tid in res.skipped_nonspawnable
+    assert tid not in [m[0] for m in res.skipped_misassigned]
+
+
+def test_misassigned_review_unblocks_back_to_review(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mis-assigned review card blocked by the guard unblocks back to
+    ``review`` (NOT ``ready``), and a same-cause re-block past
+    BLOCK_RECURRENCE_LIMIT escalates to ``triage``."""
+    _enable_review_dispatch(monkeypatch)
+    with kb.connect() as conn:
+        tid = _make_review_card(conn, "ghost-reviewer")
+        kb.dispatch_once(conn, dry_run=False)
+        assert kb.get_task(conn, tid).status == "blocked"
+        # A blocked review card resumes as review, not ready.
+        assert kb.unblock_task(conn, tid) is True
+        assert kb.get_task(conn, tid).status == "review"
+        # Same-cause re-block crosses BLOCK_RECURRENCE_LIMIT -> triage.
+        kb.dispatch_once(conn, dry_run=False)
+        assert kb.get_task(conn, tid).status == "triage"
+        assert _events(conn, tid, kind="block_loop_detected")

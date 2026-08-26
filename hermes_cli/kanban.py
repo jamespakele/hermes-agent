@@ -495,6 +495,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_assign = sub.add_parser("assign", help="Assign or reassign a task")
     p_assign.add_argument("task_id")
     p_assign.add_argument("profile", help="Profile name (or 'none' to unassign)")
+    p_assign.add_argument(
+        "--force", action="store_true",
+        help="Allow assignment to a profile that does not exist on disk "
+             "(review cards assigned to it will not auto-dispatch)",
+    )
 
     # --- set-model (per-task model/provider override) ---
     p_set_model = sub.add_parser(
@@ -540,6 +545,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_reassign.add_argument(
         "--reason", default=None,
         help="Human-readable reason (recorded on the reclaimed event)",
+    )
+    p_reassign.add_argument(
+        "--force", action="store_true",
+        help="Allow reassignment to a profile that does not exist on disk "
+             "(review cards assigned to it will not auto-dispatch)",
     )
 
     # --- diagnostics (board-wide health) ---
@@ -1890,8 +1900,37 @@ def _cmd_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def _check_profile_exists(profile: str | None, force: bool, task_id: str, action: str) -> int:
+    """Reject assignment to a profile that is not on disk.
+
+    Returns 1 to reject (caller returns immediately), 0 to proceed.
+    ``profile=None`` (unassign sentinels) always proceeds.
+    """
+    if profile is None:
+        return 0  # unassign — no check
+    if profile in kb.list_profiles_on_disk():
+        return 0  # valid profile — proceed silently
+    print(
+        f"WARNING: profile '{profile}' does not exist under "
+        f"~/.hermes/profiles/ — review cards assigned to it will "
+        f"NOT auto-dispatch.",
+        file=sys.stderr,
+    )
+    if not force:
+        print(
+            f"refusing to {action} {task_id} to missing profile "
+            f"'{profile}' (pass --force to override)",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 def _cmd_assign(args: argparse.Namespace) -> int:
     profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
+    rc = _check_profile_exists(profile, getattr(args, "force", False), args.task_id, "assign")
+    if rc:
+        return rc
     with kb.connect_closing() as conn:
         ok = kb.assign_task(conn, args.task_id, profile)
     if not ok:
@@ -1943,6 +1982,9 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
 
 def _cmd_reassign(args: argparse.Namespace) -> int:
     profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
+    rc = _check_profile_exists(profile, getattr(args, "force", False), args.task_id, "reassign")
+    if rc:
+        return rc
     with kb.connect_closing() as conn:
         ok = kb.reassign_task(
             conn, args.task_id, profile,
@@ -2724,6 +2766,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
+            "skipped_misassigned": [
+                {"task_id": tid, "assignee": who}
+                for tid, who in res.skipped_misassigned
+            ],
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
@@ -2766,6 +2812,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    if res.skipped_misassigned:
+        print(
+            "Skipped (MISSING profile — commented + blocked): "
+        )
+        for tid, who in res.skipped_misassigned:
+            print(f"  - {tid}  ->  {who}")
     return 0
 
 

@@ -348,6 +348,9 @@ VALID_HOOKS: Set[str] = {
     #     auto_blocked, rate_limited, auto_assigned_default,
     #     respawn_guarded, skipped_per_profile_capped, skipped_unassigned,
     #     skipped_nonspawnable, skipped_locked).
+    #   skipped_misassigned: list[(task_id, assignee)] of cards whose
+    #     assignee names a non-existent profile (operator error) — logged,
+    #     commented, and blocked this tick.
     #   Privacy: result carries task ids, assignees, and workspace paths.
     "on_kanban_dispatch_tick",
     # Gateway platform-boundary observer hooks (#64176). Observer-only; each

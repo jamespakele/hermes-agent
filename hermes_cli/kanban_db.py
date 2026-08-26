@@ -123,6 +123,21 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+# Assignee names that are EXPECTED non-spawnable lanes — control-plane
+# terminals (``orion-cc`` / ``orion-research`` pull cards via
+# ``claim_task`` and must NEVER auto-spawn) and skill-name reviewers
+# (``ai-code-review`` / ``ai-knowledge-review`` are skills, not profiles).
+# Tasks assigned to these lanes are silently skipped by the dispatcher
+# (``skipped_nonspawnable``), NOT flagged as operator errors. Any other
+# assignee that fails ``profile_exists`` is a genuine mis-assignment:
+# logged loudly, commented on the card, and blocked for human
+# intervention (see ``_flag_misassigned_card``).
+DEFAULT_QUIET_NONSPAWNABLE_LANES = frozenset({
+    "orion-cc",
+    "orion-research",
+    "ai-code-review",
+    "ai-knowledge-review",
+})
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -352,6 +367,7 @@ def _fire_dispatch_tick_hook(
             result.skipped_per_profile_capped,
             result.skipped_unassigned,
             result.skipped_nonspawnable,
+            result.skipped_misassigned,
         )):
             outcome = "idle"
         invoke_hook(
@@ -6409,7 +6425,7 @@ def block_task(
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
+    """Transition ``running``/``ready``/``review`` → ``blocked`` (or route elsewhere).
 
     ``kind`` (one of :data:`VALID_BLOCK_KINDS`, or ``None`` for a legacy
     un-typed block) drives routing instead of every block landing in one
@@ -6451,7 +6467,7 @@ def block_task(
         source_status = (
             _retry_status_for_run(conn, task_id)
             if cur_row["status"] == "running"
-            else "ready"
+            else ("review" if cur_row["status"] == "review" else "ready")
         )
         prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
         prev_recurrences = (
@@ -6475,7 +6491,7 @@ def block_task(
                        worker_pid    = NULL,
                        block_kind    = ?
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('running', 'ready', 'review')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
                 (kind, task_id) if expected_run_id is None
                 else (kind, task_id, int(expected_run_id)),
@@ -6513,7 +6529,7 @@ def block_task(
 
         # Truly-blocked kinds. Increment the unblock-loop counter when this is a
         # re-block for the SAME reason after a prior unblock. block_task only
-        # fires from running/ready (i.e. AFTER an unblock returned the task to
+        # fires from running/ready/review (i.e. AFTER an unblock returned the task to
         # the work pool), so a stored block_kind that matches the incoming kind
         # means: blocked → unblocked → about-to-re-block for the same cause.
         # An un-typed (None) block compares as "same" to a prior un-typed block.
@@ -6533,7 +6549,7 @@ def block_task(
                        block_kind    = ?,
                        block_recurrences = ?
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('running', 'ready', 'review')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
                 (kind, recurrences, task_id) if expected_run_id is None
                 else (kind, recurrences, task_id, int(expected_run_id)),
@@ -6572,7 +6588,7 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready')
+                       AND status IN ('running', 'ready', 'review')
                     """,
                     (kind, recurrences, task_id),
                 )
@@ -6587,7 +6603,7 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready')
+                       AND status IN ('running', 'ready', 'review')
                        AND current_run_id = ?
                     """,
                     (kind, recurrences, task_id, int(expected_run_id)),
@@ -8210,6 +8226,13 @@ class DispatchResult:
     operator-actionable failure. Tracked separately so health telemetry
     can distinguish "real stuck" (nothing spawned but spawnable work
     available) from "correctly idle" (nothing spawnable in the queue)."""
+    skipped_misassigned: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, assignee)`` pairs for tasks whose assignee names a
+    profile that does not exist — a genuine operator mis-assignment, NOT an
+    expected control-plane lane. These ARE operator-actionable: the
+    dispatcher logs loudly, posts an explanatory comment on the card, and
+    blocks it (``kind="needs_input"``) so a human can intervene. For the
+    expected-lane counterpart, see ``skipped_nonspawnable``."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -9974,6 +9997,97 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+# Marker string embedded in the comment posted on a mis-assigned card.
+# The dispatcher checks for it before re-commenting so repeated ticks on
+# the same card never spam the comment thread.
+_MISASSIGNED_COMMENT_MARKER = "auto-dispatch: missing reviewer/assignee profile"
+
+
+def _quiet_nonspawnable_lanes() -> frozenset[str]:
+    """Return the set of assignee names that are expected non-spawnable
+    lanes (control-plane terminals or skill-name reviewers), NOT operator
+    errors. Tasks assigned to these lanes are silently skipped."""
+    return DEFAULT_QUIET_NONSPAWNABLE_LANES
+
+
+def _is_quiet_lane(assignee: str) -> bool:
+    """True if the assignee is a known quiet lane (control-plane terminal
+    or seeded skill-name reviewer), NOT operator error."""
+    if not assignee:
+        return False
+    try:
+        from hermes_cli.profiles import normalize_profile_name as _norm
+    except Exception:
+        _norm = lambda n: (n or "").strip().lower()  # noqa: E731
+    return _norm(assignee) in _quiet_nonspawnable_lanes()
+
+
+def _flag_misassigned_card(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: str,
+    *,
+    lane: str,
+    dry_run: bool,
+) -> None:
+    """Loudly flag a card assigned to a non-existent profile.
+
+    A genuine operator mis-assignment (unlike a quiet lane): logs an
+    error, posts an idempotent marker comment on the card, and blocks it
+    (``kind="needs_input"``) so a human must intervene. Never crashes the
+    dispatch tick — comment/block failures degrade to warnings. In
+    dry-run the error is still logged (operators can see what WOULD be
+    flagged) but no DB writes happen. The caller appends the card to
+    ``result.skipped_misassigned`` before calling this helper.
+    """
+    _log.error(
+        "kanban dispatcher: card %s assigned to non-existent profile %r — "
+        "commented + blocked (lane=%s)",
+        task_id, assignee, lane,
+    )
+    if dry_run:
+        return
+    # Idempotency: a marker comment already on the card means we flagged it
+    # on a previous tick — don't spam the thread. Still re-block below so a
+    # card unblocked back into the work pool with the same mis-assignment
+    # keeps escalating toward ``triage`` (BLOCK_RECURRENCE_LIMIT).
+    try:
+        existing = list_comments(conn, task_id)
+    except Exception:
+        existing = []
+    if any(_MISASSIGNED_COMMENT_MARKER in (c.body or "") for c in existing):
+        _log.warning(
+            "kanban dispatcher: card %s already flagged for missing "
+            "profile %r — skipping duplicate comment",
+            task_id, assignee,
+        )
+    else:
+        body = (
+            f"{_MISASSIGNED_COMMENT_MARKER}: assignee {assignee!r} is not a "
+            f"Hermes profile (lane={lane}). This card will NOT auto-dispatch; "
+            "reassign it to a valid profile or add it to the dispatcher's "
+            "quiet lanes."
+        )
+        try:
+            add_comment(conn, task_id, author="kanban-dispatcher", body=body)
+        except Exception:
+            _log.warning(
+                "kanban dispatcher: failed to comment on mis-assigned card %s",
+                task_id, exc_info=True,
+            )
+    try:
+        block_task(
+            conn, task_id,
+            kind="needs_input",
+            reason=f"missing reviewer/assignee profile {assignee!r}",
+        )
+    except Exception:
+        _log.warning(
+            "kanban dispatcher: failed to block mis-assigned card %s",
+            task_id, exc_info=True,
+        )
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -10342,13 +10456,20 @@ def _dispatch_once_locked(
         except Exception:
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row_assignee):
-            # Bucket separately from skipped_unassigned: the operator
-            # cannot fix this by assigning a profile (the assignee IS the
-            # intended owner — a terminal lane). Health telemetry uses
-            # this distinction to suppress spurious "stuck" warnings on
-            # multi-lane setups where the ready queue is steadily full
-            # of human-pulled work.
-            result.skipped_nonspawnable.append(row["id"])
+            if _is_quiet_lane(row_assignee):
+                # Expected control-plane lane / skill-name reviewer — skip
+                # silently. Health telemetry uses this bucket to suppress
+                # spurious "stuck" warnings on multi-lane setups where the
+                # ready queue is steadily full of human-pulled work.
+                result.skipped_nonspawnable.append(row["id"])
+                continue
+            # Genuine missing profile — operator error. LOUD path: log,
+            # comment on the card, block for human intervention.
+            result.skipped_misassigned.append((row["id"], row_assignee))
+            _flag_misassigned_card(
+                conn, row["id"], row_assignee,
+                lane="ready", dry_run=dry_run,
+            )
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
@@ -10496,7 +10617,16 @@ def _dispatch_once_locked(
         except Exception:
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
-            result.skipped_nonspawnable.append(row["id"])
+            if _is_quiet_lane(row["assignee"]):
+                result.skipped_nonspawnable.append(row["id"])
+                continue
+            # Genuine missing profile — operator error. LOUD path: log,
+            # comment on the card, block for human intervention.
+            result.skipped_misassigned.append((row["id"], row["assignee"]))
+            _flag_misassigned_card(
+                conn, row["id"], row["assignee"],
+                lane="review", dry_run=dry_run,
+            )
             continue
         if _per_profile_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)

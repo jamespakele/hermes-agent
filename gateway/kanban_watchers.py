@@ -1723,6 +1723,19 @@ class GatewayKanbanWatchersMixin:
                                 res.promoted,
                                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                             )
+                        # Mis-assignments are operator errors — surface them
+                        # even on an otherwise-idle board (no spawns), so a
+                        # card silently parked behind a non-existent profile
+                        # is never invisible to operators.
+                        if res is not None and getattr(
+                            res, "skipped_misassigned", None
+                        ):
+                            logger.error(
+                                "kanban dispatcher [%s]: %d task(s) BLOCKED "
+                                "due to non-existent profile assignment: %s",
+                                slug, len(res.skipped_misassigned),
+                                res.skipped_misassigned,
+                            )
                     # Health telemetry (aggregate across boards)
                     ready_pending = await asyncio.to_thread(_ready_nonempty)
                     if ready_pending and not any_spawned:

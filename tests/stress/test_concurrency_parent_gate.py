@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import random
+import shutil
 import sys
 import tempfile
 import threading
@@ -37,11 +38,41 @@ def run() -> int:
     home = tempfile.mkdtemp(prefix="hermes_parent_gate_stress_")
     os.environ["HERMES_HOME"] = home
     os.environ["HOME"] = home
+    # HARD ISOLATION: pin the kanban root to the temp dir AND assert it took.
+    # kanban_db_path() honors HERMES_KANBAN_HOME first, then
+    # get_default_hermes_root(), which is MEMOIZED and can resolve to the LIVE
+    # ~/.hermes even when HERMES_HOME points at a temp dir — if the memo was
+    # populated before this env change, this stress test silently writes its
+    # parent-N / child fixtures onto the real board. Pinning HERMES_KANBAN_HOME
+    # (and asserting the resolved path) makes the leak impossible.
+    os.environ["HERMES_KANBAN_HOME"] = home
 
     from hermes_cli import kanban_db as kb
 
-    kb.init_db()
+    # Refuse to run unless the DB provably resolves inside the temp dir.
+    _resolved = str(kb.kanban_db_path()).rstrip("/")
+    if not _resolved.startswith(home):
+        raise SystemExit(
+            "STRESS REFUSED TO RUN: kanban DB resolves outside the temp home "
+            f"({_resolved!r}); expected under {home!r}. The parent/child "
+            "fixtures would have polluted the live board. Fix the isolation pin."
+        )
 
+    try:
+        kb.init_db()
+        _body(kb)
+    finally:
+        # Clean up after itself: never leave fixtures behind, isolated or not.
+        shutil.rmtree(home, ignore_errors=True)
+    # _body sets the exit status; run() maps it.
+    return _EXIT
+
+
+_EXIT = 0
+
+
+def _body(kb) -> None:
+    global _EXIT
     # Seed N parents in 'ready' state. They stay ready for the whole run
     # (never 'done'), so every child linked to one of them must remain
     # unclaimable.
@@ -169,14 +200,15 @@ def run() -> int:
     print(f"event-log bad:     {len(bad)}")
     print(f"claim_rejected:    {rejections}")
 
+    global _EXIT
     if violations or bad:
         for v in violations[:10]:
             print("  VIOLATION:", v)
         for row in list(bad)[:10]:
             print("  EVENT-LOG BAD:", dict(row))
-        return 1
+        _EXIT = 1
+        return
     print("PARENT-GATE INVARIANT HELD UNDER RACE")
-    return 0
 
 
 if __name__ == "__main__":

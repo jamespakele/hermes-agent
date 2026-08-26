@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import threading
 from pathlib import Path
 
@@ -177,5 +178,104 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 # /kanban help / no-args / unknown-action UX (issue #21794)
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# assign/reassign guard against non-existent profiles
+# ---------------------------------------------------------------------------
+
+
+def _parse(tokens):
+    """Build the full argparse tree once and parse a kanban command."""
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+    return parser.parse_args(tokens)
+
+
+def _make_profile(home, name):
+    p = home / "profiles" / name
+    p.mkdir(parents=True)
+    (p / "config.yaml").write_text(f"name: {name}\n")
+    return p
+
+
+def _create_task(home):
+    out = kc.run_slash("create 'gt' --assignee none")
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m, out
+    return m.group(1)
+
+
+def _assignee(tid):
+    with kb.connect() as conn:
+        row = conn.execute("SELECT assignee FROM tasks WHERE id=?", (tid,)).fetchone()
+    return row["assignee"]
+
+
+def test_assign_phantom_profile_rejected(kanban_home, capsys):
+    tid = _create_task(kanban_home)
+    args = _parse(["kanban", "assign", tid, "ghost"])
+    rc = kc.kanban_command(args)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "ghost" in err and "does not exist" in err
+    assert "NOT auto-dispatch" in err
+    assert _assignee(tid) == "none"  # board untouched — not "ghost"
+
+
+def test_assign_valid_profile_unaffected(kanban_home, capsys):
+    _make_profile(kanban_home, "ai-coder")
+    tid = _create_task(kanban_home)
+    args = _parse(["kanban", "assign", tid, "ai-coder"])
+    rc = kc.kanban_command(args)
+    assert rc == 0
+    assert capsys.readouterr().err == ""  # no warning for valid profile
+    assert _assignee(tid) == "ai-coder"
+
+
+def test_assign_phantom_profile_forced_warns_but_assigns(kanban_home, capsys):
+    tid = _create_task(kanban_home)
+    args = _parse(["kanban", "assign", tid, "ghost", "--force"])
+    rc = kc.kanban_command(args)
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "ghost" in err and "does not exist" in err  # warning still printed
+    assert _assignee(tid) == "ghost"
+
+
+def test_assign_none_still_unassigns(kanban_home, capsys):
+    tid = _create_task(kanban_home)
+    args = _parse(["kanban", "assign", tid, "none"])
+    rc = kc.kanban_command(args)
+    assert rc == 0
+    assert capsys.readouterr().err == ""  # unassign must NOT trigger guard
+    assert _assignee(tid) is None
+
+
+def test_reassign_phantom_rejected(kanban_home, capsys):
+    _make_profile(kanban_home, "ai-coder")
+    tid = _create_task(kanban_home)
+    kc.kanban_command(_parse(["kanban", "assign", tid, "ai-coder"]))
+    capsys.readouterr()
+    args = _parse(["kanban", "reassign", tid, "ghost"])
+    rc = kc.kanban_command(args)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "ghost" in err and "does not exist" in err
+    assert _assignee(tid) == "ai-coder"  # not clobbered
+
+
+def test_reassign_valid_profile_unaffected(kanban_home, capsys):
+    _make_profile(kanban_home, "ai-coder")
+    _make_profile(kanban_home, "ai-knowledge")
+    tid = _create_task(kanban_home)
+    kc.kanban_command(_parse(["kanban", "assign", tid, "ai-coder"]))
+    capsys.readouterr()
+    args = _parse(["kanban", "reassign", tid, "ai-knowledge"])
+    rc = kc.kanban_command(args)
+    assert rc == 0
+    assert capsys.readouterr().err == ""
+    assert _assignee(tid) == "ai-knowledge"
 
 
