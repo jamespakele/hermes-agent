@@ -24,6 +24,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -315,7 +316,45 @@ def gmail_get(args):
 
 
 
+# --- Outbound email guardrail ---
+# The r2 account must NEVER email a client/external address directly.
+# All outbound email must go to James as a DRAFT for review and forwarding.
+# Any recipient outside this allowlist is refused (exit 2) before any send runs.
+ALLOWED_EMAIL_RECIPIENTS = {"james@pakele.ai", "jamespakele@dcshawaii.org"}
+
+
+def _assert_allowed_recipients(*recipients: str) -> None:
+    """Block any outbound Gmail send whose recipient is not on the allowlist.
+
+    Parses display-name <addr> wrappers and comma-separated lists. If any
+    parsed address (case-insensitive, whitespace-stripped) is not in
+    ALLOWED_EMAIL_RECIPIENTS, prints a BLOCKED message to stderr and exits 2.
+    No email is sent.
+    """
+    bad = []
+    for raw in recipients:
+        if not raw:
+            continue
+        for chunk in str(raw).split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            m = re.search(r"<([^>]+)>", chunk)
+            addr = m.group(1).strip().lower() if m else chunk.lower().strip()
+            if addr and addr not in ALLOWED_EMAIL_RECIPIENTS:
+                bad.append(addr)
+    if bad:
+        print(
+            f"BLOCKED: outbound email to {bad} is not allowed. The r2 account "
+            f"may only email {sorted(ALLOWED_EMAIL_RECIPIENTS)} as a DRAFT for "
+            f"James to review and forward. No message was sent.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+
 def gmail_send(args):
+    _assert_allowed_recipients(args.to, args.cc)
     if _gws_binary():
         message = MIMEText(args.body, "html" if args.html else "plain")
         message["To"] = args.to
@@ -370,6 +409,7 @@ def gmail_reply(args):
             },
         )
         headers = _headers_dict(original)
+        _assert_allowed_recipients(headers.get("from", ""))
 
         subject = headers.get("subject", "")
         if not subject.startswith("Re:"):
@@ -399,6 +439,7 @@ def gmail_reply(args):
         metadataHeaders=["From", "Subject", "Message-ID"],
     ).execute()
     headers = _headers_dict(original)
+    _assert_allowed_recipients(headers.get("from", ""))
 
     subject = headers.get("subject", "")
     if not subject.startswith("Re:"):
