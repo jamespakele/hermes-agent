@@ -78,8 +78,15 @@ Output a single JSON object with this exact shape:
 
 Rules:
   - "parents" is a list of INDICES (0-based) into this same "tasks" list,
+    OR the task ids of the "Existing children" listed in the prompt —
     expressing actual data dependencies. Tasks with no parents run in
     PARALLEL. Tasks with parents wait until every parent completes.
+  - When a new task's work depends on an existing child (e.g. a
+    test-executor that must run against an implementation story already
+    created), list that existing child's id in "parents" so the new task
+    waits for it. The decomposer will release that existing child from
+    the root task's gating automatically, so the root never blocks the
+    work its own children depend on.
   - Prefer parallelism. If two tasks can be done independently, give
     them no parents so the dispatcher fans them out at once.
   - Use 2-6 tasks for normal work. Don't create 20 tiny tasks. Don't
@@ -113,6 +120,9 @@ _USER_TEMPLATE = """Task id: {task_id}
 Title: {title}
 Body:
 {body}
+
+Existing children of this task (may be referenced as parents by id):
+{existing_children}
 
 Available profiles (assignees you may pick from):
 {roster}
@@ -249,6 +259,25 @@ def _format_roster(roster: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _format_existing_children(conn, task_id: str) -> str:
+    """Return ``"<id>: <title>"`` lines for the root's existing children.
+
+    The decomposer may reference these ids in ``parents`` (e.g. a
+    test-executor that must wait on an implementation story the dispatch
+    script already created under the root). Returns ``"(none)"`` when the
+    root has no children yet.
+    """
+    ids = kb.child_ids(conn, task_id)
+    if not ids:
+        return "(none)"
+    lines = []
+    for cid in ids:
+        row = kb.get_task(conn, cid)
+        title = _truncate((row.title if row else "") or "", 120)
+        lines.append(f"  - {cid}: {title}")
+    return "\n".join(lines)
+
+
 def _normalize_assignee_choice(
     assignee: object,
     *,
@@ -297,6 +326,15 @@ def decompose_task(
     auto_promote = bool(kanban_cfg.get("auto_promote_children", True))
     roster, valid_names = _build_roster()
 
+    # The dispatch script may have pre-created implementation stories as
+    # children of this root before decompose ran. The decomposer must see
+    # them so it can express "test-executor depends on impl story" as a
+    # string-id parent — otherwise it rebuilds the semantic deadlock where
+    # the root gates the impl the root's own children need.
+    with kb.connect_closing() as conn:
+        existing_children = _format_existing_children(conn, task_id)
+        preexisting_child_ids = set(kb.child_ids(conn, task_id))
+
     try:
         from agent.auxiliary_client import call_llm  # type: ignore
     except Exception as exc:
@@ -307,6 +345,7 @@ def decompose_task(
         task_id=task.id,
         title=_truncate(task.title or "", 400),
         body=_truncate(task.body or "(no body)", 4000),
+        existing_children=existing_children,
         roster=_format_roster(roster),
         default_assignee=default_assignee,
     )
@@ -420,8 +459,21 @@ def decompose_task(
         parents = entry.get("parents") or []
         if not isinstance(parents, list):
             parents = []
-        # Clean parent indices: drop non-int and out-of-range.
-        clean_parents = [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx]
+        # Clean parent entries: int indices into this same list, or the
+        # task ids of the root's pre-existing children listed in the prompt.
+        # Drop anything else (and log it) so a bad parent never reaches the DB.
+        clean_parents = []
+        for p in parents:
+            if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx:
+                clean_parents.append(p)
+            elif isinstance(p, str) and p.strip() in preexisting_child_ids:
+                clean_parents.append(p.strip())
+            else:
+                logger.info(
+                    "decompose: task %s child %d parent %r is not a valid index "
+                    "or pre-existing child id — dropping",
+                    task_id, idx, p,
+                )
         children.append({
             "title": title.strip()[:200],
             "body": body.strip(),

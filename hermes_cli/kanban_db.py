@@ -7484,14 +7484,30 @@ def decompose_triage_task(
             "title": "...",
             "body": "...",                     # optional
             "assignee": "profile-name",        # optional, None -> default fallback
-            "parents": [0, 2],                 # indices into this same children list
+            "parents": [0, 2],                 # indices into this same children list,
+                                               # or ids of the root's pre-existing children
         }
+
+    A parent entry is either an int index into ``children`` (a sibling
+    dependency) or the string id of a pre-existing child of the root task
+    (e.g. an implementation story the dispatch script created before
+    decompose ran). When a new child depends on a pre-existing root child
+    by id, the root's gating link to that child is removed (auto-repair):
+    the epic/terminal node must never gate a story its own children depend
+    on, or the graph deadlocks — the root waits on the test-executor, the
+    test-executor waits on the impl story, and the impl story waits on the
+    root.
 
     Returns the list of created child task ids (in input order) on
     success. Returns ``None`` when:
       - The root task does not exist
       - The root task is not in ``triage``
-      - A cycle would result (caller built a bad graph)
+
+    Raises ``ValueError`` when:
+      - A child's title is missing or a parent entry is malformed
+      - A string-id parent is not a pre-existing child of the root
+      - The full graph (children + root links + pre-existing links)
+        contains a cycle that auto-repair cannot resolve
 
     Validation of titles/assignees happens inside the same write_txn as
     the inserts so a malformed entry aborts the whole decomposition
@@ -7514,12 +7530,44 @@ def decompose_triage_task(
         if not isinstance(parents_idx, list):
             raise ValueError(f"child[{idx}].parents must be a list")
         for p in parents_idx:
-            if not isinstance(p, int) or p < 0 or p >= len(children):
+            if isinstance(p, int):
+                if p < 0 or p >= len(children):
+                    raise ValueError(
+                        f"child[{idx}].parents[{p}] is not a valid index into children"
+                    )
+                if p == idx:
+                    raise ValueError(f"child[{idx}] cannot list itself as a parent")
+            elif not isinstance(p, str) or not p.strip():
                 raise ValueError(
-                    f"child[{idx}].parents[{p}] is not a valid index into children"
+                    f"child[{idx}].parents[{p!r}] must be an index into children "
+                    "or the id of a pre-existing child of the root"
                 )
-            if p == idx:
-                raise ValueError(f"child[{idx}] cannot list itself as a parent")
+            # String ids are validated against the root's actual children below.
+
+    # Load the root and its pre-existing children (read-only). String-id
+    # parents must name one of the root's existing children; the write_txn
+    # below re-validates the root row for atomicity.
+    root_pre = conn.execute(
+        "SELECT id, status FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if root_pre is None:
+        return None
+    if root_pre["status"] != "triage":
+        return None
+    preexisting_ids = [
+        r["child_id"] for r in conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
+            (task_id,),
+        ).fetchall()
+    ]
+    preexisting_set = set(preexisting_ids)
+    for idx, child in enumerate(children):
+        for p in child.get("parents") or []:
+            if isinstance(p, str) and p not in preexisting_set:
+                raise ValueError(
+                    f"child[{idx}].parents[{p!r}] is not a pre-existing child "
+                    "of the root task"
+                )
 
     # Detect cycles in the sibling parent graph (Kahn's topological sort).
     # link_tasks() calls _would_cycle() for every new edge; here we check
@@ -7530,6 +7578,8 @@ def decompose_triage_task(
     _adj: list[list[int]] = [[] for _ in range(len(children))]
     for _i, _c in enumerate(children):
         for _p in (_c.get("parents") or []):
+            if not isinstance(_p, int):
+                continue  # pre-existing-root-child id — covered by the full-graph check
             _adj[_p].append(_i)
             _in_deg[_i] += 1
     _queue = [_i for _i in range(len(children)) if _in_deg[_i] == 0]
@@ -7543,6 +7593,84 @@ def decompose_triage_task(
                 _queue.append(_nb)
     if _seen != len(children):
         raise ValueError("cyclic dependency detected in decomposed children list")
+
+    # Full-graph cycle check over {root} U {pre-existing root children} U
+    # {new children}, including existing task_links among those nodes. The
+    # sibling check above only covers the new children; the root-under-child
+    # links and pre-existing edges can still deadlock the graph — the exact
+    # test-epic bug: the root gates the impl story (root -> impl), the
+    # test-executor waits on the impl (impl -> executor), and the root waits
+    # on the test-executor (executor -> root). That is a DAG by Kahn's
+    # standards, yet no task can ever dispatch.
+    unlink_from_root: set[str] = set()
+    for child in children:
+        for p in child.get("parents") or []:
+            if isinstance(p, str):
+                unlink_from_root.add(p)
+    _nodes = [task_id] + preexisting_ids + [f"__new_{i}__" for i in range(len(children))]
+    _node_idx = {n: i for i, n in enumerate(_nodes)}
+    _n = len(_nodes)
+    _existing_edges: list[tuple[str, str]] = []
+    _ph = ",".join("?" * len(_nodes))
+    for r in conn.execute(
+        f"SELECT parent_id, child_id FROM task_links "
+        f"WHERE parent_id IN ({_ph}) AND child_id IN ({_ph})",
+        _nodes + _nodes,
+    ):
+        if r["parent_id"] == task_id and r["child_id"] in preexisting_set:
+            # root -> pre-existing-child edges are added below so the
+            # auto-repair can exclude the ones being unlinked
+            continue
+        _existing_edges.append((r["parent_id"], r["child_id"]))
+
+    def _graph_cyclic(exclude_root_edges: frozenset) -> bool:
+        """Kahn's over the full graph; True when a cycle exists."""
+        indeg = [0] * _n
+        adj: list[list[int]] = [[] for _ in range(_n)]
+
+        def _add(parent_node: str, child_node: str) -> None:
+            adj[_node_idx[parent_node]].append(_node_idx[child_node])
+            indeg[_node_idx[child_node]] += 1
+
+        for _pe, _ce in _existing_edges:
+            _add(_pe, _ce)
+        for _idx, _child in enumerate(children):
+            _new_node = f"__new_{_idx}__"
+            for _p in _child.get("parents") or []:
+                if isinstance(_p, str):
+                    _add(_p, _new_node)
+                else:
+                    _add(f"__new_{_p}__", _new_node)
+            _add(_new_node, task_id)
+        for _xid in preexisting_ids:
+            if _xid not in exclude_root_edges:
+                _add(task_id, _xid)
+        _queue = [_i for _i in range(_n) if indeg[_i] == 0]
+        _seen = 0
+        while _queue:
+            _node = _queue.pop()
+            _seen += 1
+            for _nb in adj[_node]:
+                indeg[_nb] -= 1
+                if indeg[_nb] == 0:
+                    _queue.append(_nb)
+        return _seen != _n
+
+    if _graph_cyclic(frozenset()):
+        # Auto-repair: the root must not gate a pre-existing child the new
+        # graph depends on. Unlink those edges and re-check; if a cycle
+        # survives, reject the whole decompose (no orphan children).
+        if _graph_cyclic(frozenset(unlink_from_root)):
+            raise ValueError(
+                "cyclic dependency detected in decomposed children list "
+                "(including root links)"
+            )
+        _log.info(
+            "decompose: unlinked %d pre-existing root child(ren) that the "
+            "decomposed graph depends on: %s",
+            len(unlink_from_root),
+            ", ".join(sorted(unlink_from_root)),
+        )
 
     # We do the full decomposition in a SINGLE write_txn so it's
     # atomic: either every child is created AND the root flips to
@@ -7628,6 +7756,8 @@ def decompose_triage_task(
         # Link children to their sibling parents (within the decomposed graph).
         for idx, child in enumerate(children):
             for p_idx in child.get("parents") or []:
+                if not isinstance(p_idx, int):
+                    continue  # pre-existing-root-child id — linked below
                 parent_id = child_ids[p_idx]
                 child_id = child_ids[idx]
                 conn.execute(
@@ -7640,10 +7770,42 @@ def decompose_triage_task(
                     {"parent": parent_id, "child": child_id},
                 )
 
+        # Auto-repair: release pre-existing root children that the new graph
+        # depends on from the root's gating. Mirrors the validated manual
+        # recovery — `hermes kanban unlink <epic> <impl-story>` — so the
+        # epic/terminal node never gates a story its own children need.
+        for xid in sorted(unlink_from_root):
+            conn.execute(
+                "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
+                (task_id, xid),
+            )
+            _append_event(
+                conn, xid, "unlinked",
+                {"parent": task_id, "child": xid},
+            )
+
+        # Link children to pre-existing root children referenced by id
+        # (e.g. the test-executor waits on the impl story).
+        for idx, child in enumerate(children):
+            child_id = child_ids[idx]
+            for p in child.get("parents") or []:
+                if isinstance(p, str):
+                    conn.execute(
+                        "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
+                        "VALUES (?, ?)",
+                        (p, child_id),
+                    )
+                    _append_event(
+                        conn, child_id, "linked",
+                        {"parent": p, "child": child_id},
+                    )
+
         # Link the ROOT task as a child of every leaf child — i.e. the
         # root waits for the whole graph. Simpler than computing leaves:
         # link root under every child. Cycle-free because the root is
-        # only ever a child here, never a parent of children.
+        # only ever a child here, never a parent of children (any
+        # root -> pre-existing-child edge that would cycle was unlinked
+        # above).
         for cid in child_ids:
             conn.execute(
                 "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
