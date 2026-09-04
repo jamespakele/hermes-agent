@@ -8,7 +8,10 @@ and the assignee-fallback logic.
 from __future__ import annotations
 
 import json as jsonlib
+import os
+import subprocess
 from pathlib import Path
+from typing import Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -159,5 +162,99 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
             p.stop()
     assert outcome.ok is False
     assert "not in triage" in outcome.reason
+
+
+def _make_git_repo(path: Path, remote: Optional[str] = None) -> Path:
+    """Create an offline tmp git repo with an initial commit (and optional
+    origin remote). No network, no host git config leak."""
+    path.mkdir(parents=True, exist_ok=True)
+    env = dict(
+        os.environ,
+        GIT_CONFIG_GLOBAL="/dev/null",
+        GIT_CONFIG_SYSTEM="/dev/null",
+    )
+
+    def run(*args: str) -> None:
+        subprocess.run(
+            ["git", "-C", str(path), *args],
+            check=True, capture_output=True, env=env,
+        )
+
+    run("init", "-q")
+    run("config", "user.name", "test")
+    run("config", "user.email", "test@test")
+    (path / "README.md").write_text("repo\n")
+    run("add", "README.md")
+    run("commit", "-q", "-m", "init")
+    if remote:
+        run("remote", "add", "origin", remote)
+    return path
+
+
+def test_decompose_rejection_helper_posts_comment_on_root(kanban_home):
+    # The rejection path externalizes the DB ValueError as a board comment
+    # so a rejected decompose is visible on the epic (not just in the CLI
+    # return). The epic stays in triage; the comment carries the reason.
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ambiguous epic", triage=True)
+
+    ok = decomp._record_decompose_rejection(
+        tid, ValueError("no such repo"), author="me"
+    )
+    assert ok is True
+    with kb.connect() as conn:
+        comments = kb.list_comments(conn, tid)
+        task = kb.get_task(conn, tid)
+    assert any("no such repo" in (c.body or "") for c in comments)
+    assert any("remains in triage" in (c.body or "") for c in comments)
+    assert task.status == "triage"
+
+
+def test_decompose_valueerror_path_returns_cleanly_and_comments(kanban_home):
+    # End-to-end wiring: when decompose_triage_task raises ValueError (the
+    # cross-repo fail-loud path), decompose_task returns ok=False naming
+    # the triage state, posts the rejection comment, and leaves the epic in
+    # triage with zero children.
+    repo = _make_git_repo(
+        kanban_home.parent / "repos" / "recipe-base",
+        remote="https://github.com/crabby-apps/recipe-base.git",
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="epic",
+            body="fan me out",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            triage=True,
+        )
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "test",
+        "tasks": [
+            {"title": "guard", "body": "the code lives in jamespakele/iq-kip-v2", "assignee": None, "parents": []},
+        ],
+    })
+
+    patches = _patch_list_profiles(["orchestrator"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    assert "remains in triage" in outcome.reason
+    with kb.connect() as conn:
+        comments = kb.list_comments(conn, tid)
+        task = kb.get_task(conn, tid)
+        children = kb.child_ids(conn, tid)
+    assert task.status == "triage"
+    assert children == []
+    assert any("jamespakele/iq-kip-v2" in (c.body or "") for c in comments)
 
 

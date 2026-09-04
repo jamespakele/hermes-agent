@@ -297,6 +297,35 @@ def _normalize_assignee_choice(
     return chosen
 
 
+def _record_decompose_rejection(task_id: str, exc: Exception, *, author: Optional[str] = None) -> bool:
+    """Post the rejection reason on the root task so the failure is visible
+    on the board, not just in the CLI return value.
+
+    ``decompose_triage_task`` rolls back atomically on ``ValueError`` (zero
+    children written), so the only thing a rejected decompose leaves behind
+    is this comment: the epic stays in ``triage`` and a human resolves the
+    repo-anchor ambiguity before re-running decompose. Uses a fresh
+    connection (the DB-layer call that raised has already rolled back).
+    Returns ``False`` when the task vanished (nothing to comment on).
+    """
+    body = (
+        "Decompose rejected (no children created; epic remains in triage): "
+        f"{exc}. "
+        "Fix the child card's repo references (or resolve the repo locally), "
+        "then re-run decompose."
+    )
+    try:
+        with kb.connect_closing() as conn:
+            return bool(
+                kb.add_comment(
+                    conn, task_id, author or "decomposer", body
+                )
+            )
+    except Exception:
+        logger.exception("decompose: failed to record rejection comment on %s", task_id)
+        return False
+
+
 def decompose_task(
     task_id: str,
     *,
@@ -492,7 +521,16 @@ def decompose_task(
                 auto_promote=auto_promote,
             )
     except ValueError as exc:
-        return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")
+        # The DB layer rolled back atomically — zero children written. Make
+        # the rejection visible on the board: the epic stays in triage with
+        # a comment naming the reason and the human action, instead of a
+        # silent failure that leaves the epic stranded in triage.
+        _record_decompose_rejection(task_id, exc, author=audit_author)
+        return DecomposeOutcome(
+            task_id,
+            False,
+            f"DB rejected graph: {exc}; epic remains in triage awaiting input",
+        )
     except Exception as exc:
         logger.exception("decompose: DB error on task %s", task_id)
         return DecomposeOutcome(task_id, False, f"DB error: {type(exc).__name__}")

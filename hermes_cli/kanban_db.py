@@ -7546,9 +7546,14 @@ def decompose_triage_task(
 
     # Load the root and its pre-existing children (read-only). String-id
     # parents must name one of the root's existing children; the write_txn
-    # below re-validates the root row for atomicity.
+    # below re-validates the root row for atomicity. The workspace fields
+    # are read here (not inside the txn) so the cross-repo anchor detection
+    # can run BEFORE the write_txn — the board's BEGIN IMMEDIATE lock never
+    # spans the git subprocess probes.
     root_pre = conn.execute(
-        "SELECT id, status FROM tasks WHERE id = ?", (task_id,)
+        "SELECT id, status, workspace_kind, workspace_path, project_id "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
     ).fetchone()
     if root_pre is None:
         return None
@@ -7672,6 +7677,23 @@ def decompose_triage_task(
             ", ".join(sorted(unlink_from_root)),
         )
 
+    # Cross-repo anchor detection (t_65ca3bd5 guard). Runs BEFORE the
+    # write_txn so the board's BEGIN IMMEDIATE lock never spans the git
+    # subprocess probes (sibling scan + remote reads), and so a rejection
+    # leaves zero rows written — same no-orphan-children guarantee as the
+    # cycle rejection above. The verdict below (root_is_git,
+    # child_anchors) is consumed by the insert loop inside the txn; the
+    # txn re-validates the root row, so a root that flips out of triage
+    # between here and there still aborts safely.
+    root_ws_kind_pre = root_pre["workspace_kind"] or "scratch"
+    root_ws_path_pre = root_pre["workspace_path"]
+    root_is_git = bool(root_ws_path_pre) and _is_git_checkout(Path(root_ws_path_pre))
+    child_anchors: Optional[dict[int, str]] = None
+    if root_ws_kind_pre == "worktree" and root_is_git:
+        child_anchors = _detect_alternate_repo_anchor(
+            Path(root_ws_path_pre), children
+        )
+
     # We do the full decomposition in a SINGLE write_txn so it's
     # atomic: either every child is created AND the root flips to
     # ``todo``, or nothing changes. We deliberately do NOT call any
@@ -7683,7 +7705,7 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, project_id "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -7698,6 +7720,7 @@ def decompose_triage_task(
         # override with its own 'workspace_kind' / 'workspace_path'.
         root_ws_kind = root_row["workspace_kind"] or "scratch"
         root_ws_path = root_row["workspace_path"]
+        root_project_id = root_row["project_id"]
 
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
@@ -7721,19 +7744,32 @@ def decompose_triage_task(
                 # root's literal path would put every child in the same
                 # directory on the first-dispatched sibling's branch, with
                 # no lock — siblings can be promoted and dispatched
-                # concurrently. Leave the path unset so dispatch
-                # materializes a fresh <repo>/.worktrees/<child-id> per
-                # child from the board anchor.
-                child_ws_path = None
+                # concurrently. Reset the path to the resolved anchor so
+                # dispatch materializes a fresh <repo>/.worktrees/<child-id>
+                # per child from a repo the decomposition actually targets:
+                # the root's own checkout by default (the cross-repo
+                # misroute fix), or the one repo the child's text positively
+                # locates (defense-in-depth re-anchor). When detection ran,
+                # a child with no locator-signalled evidence simply inherits
+                # the root anchor (absent from the dict) and the fallback
+                # below resolves to root_ws_path. When detection did not
+                # run (scratch root, or a non-git root path), the legacy
+                # NULL board-default behavior is preserved instead of
+                # hard-failing at claim time.
+                if child_anchors is not None:
+                    child_ws_path = child_anchors.get(idx, root_ws_path)
+                else:
+                    child_ws_path = root_ws_path if (root_ws_path and root_is_git) else None
             elif child_ws_kind == root_ws_kind:
                 child_ws_path = root_ws_path
             else:
                 child_ws_path = None
+            child_project_id = root_project_id
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, project_id, tenant, created_at, created_by) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -7741,6 +7777,7 @@ def decompose_triage_task(
                     assignee,
                     child_ws_kind,
                     child_ws_path,
+                    child_project_id,
                     tenant,
                     now,
                     (author or "decomposer"),
@@ -8055,6 +8092,287 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         if current == current.parent:
             return None
         current = current.parent
+
+
+# ---------------------------------------------------------------------------
+# Decompose cross-repo anchor detection
+# ---------------------------------------------------------------------------
+# Guard against the t_65ca3bd5 failure mode: a decomposed worktree child
+# whose card text names a different application's repo silently anchoring
+# into whatever repo the board's mutable default_workdir points at. The
+# rules below are deliberately fixed-token — no NLP: tokens resolve against
+# a deterministic candidate set, negation and issue-ref contexts exclude
+# them, and only workspace-locator signals promote a mention to evidence.
+
+_DECOMPOSE_SLUG_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+_DECOMPOSE_ABS_PATH_RE = re.compile(
+    r"(?<!\S)/(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+"
+)
+_DECOMPOSE_LOCATOR_WORDS_RE = re.compile(
+    r"\b(?:lives in|anchor to|worktree|workspace|checkout)\b", re.IGNORECASE
+)
+_DECOMPOSE_ASSERTION_WORDS_RE = re.compile(
+    r"\b(?:repo|repository|checkout of|checkout|clone|fork|anchor|"
+    r"lives in|anchor to|in repo|worktree|workspace)\b",
+    re.IGNORECASE,
+)
+_DECOMPOSE_NEGATION_RE = re.compile(
+    r"(?:not\b|no\b|n't\b|never\b|rather than\b|instead of\b)", re.IGNORECASE
+)
+
+
+def _is_git_checkout(path: Path) -> bool:
+    """True when ``path`` is a git checkout (repo root or linked worktree)."""
+    try:
+        if (path / ".git").exists():
+            return True
+    except OSError:
+        pass
+    return _git_toplevel(path) is not None
+
+
+def _git_remote_url(repo_root: Path) -> Optional[str]:
+    """The repo's ``remote.origin.url`` (``None`` when unset/unreadable)."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "config", "--get", "remote.origin.url"],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=30, check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    out = (result.stdout or "").strip()
+    return out or None
+
+
+def _normalize_repo_identity(raw: str) -> Optional[str]:
+    """Normalize a remote URL / owner-name slug to lowercase ``owner/name``.
+
+    Handles scp-like (``git@host:owner/name.git``), URL
+    (``https://host/owner/name.git``) and bare (``owner/name``) forms.
+    Returns ``None`` when the string has no owner/name shape.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return None
+    if "://" not in s and ":" in s:
+        s = s.rsplit(":", 1)[-1]
+    s = re.sub(r"^[a-z][a-z0-9+.-]*://", "", s)
+    s = s.split("@", 1)[-1].strip("/")
+    parts = [p for p in s.split("/") if p]
+    if len(parts) < 2:
+        return None
+    owner, name = parts[-2].lower(), re.sub(r"\.git$", "", parts[-1].lower())
+    if not owner or not name:
+        return None
+    if not re.fullmatch(r"[a-z0-9_.-]+", owner) or not re.fullmatch(r"[a-z0-9_.-]+", name):
+        return None
+    return f"{owner}/{name}"
+
+
+def _repo_identities(repo_root: Path) -> set[str]:
+    """Candidate-match identities for a git checkout: remote owner/name + dirname."""
+    out = {repo_root.name.lower()}
+    remote = _git_remote_url(repo_root)
+    norm = _normalize_repo_identity(remote) if remote else None
+    if norm:
+        out.add(norm)
+    return out
+
+
+def _slug_is_noise(owner: str, name: str) -> bool:
+    """True for prose-noise slug shapes: ``epic/61`` (digits) or task ids."""
+    return name.startswith("t_") or owner.isdigit() or name.isdigit()
+
+
+def _token_is_noise(text: str, start: int, end: int) -> bool:
+    """True when the token at ``[start:end)`` is a segment of a longer
+    slash-path (``server/api/src/...``), an issue reference (``owner/name#123``)
+    or an issue/branch ref shape."""
+    if start > 0 and text[start - 1] == "/":
+        return True
+    if end < len(text) and text[end] == "/":
+        return True
+    if (
+        end < len(text)
+        and text[end] == "#"
+        and end + 1 < len(text)
+        and text[end + 1].isdigit()
+    ):
+        # GitHub issue reference (owner/name#digits) — repo evidence
+        # exclusion, never an anchor.
+        return True
+    owner, _, name = text[start:end].partition("/")
+    return _slug_is_noise(owner, name)
+
+
+def _token_negated(text: str, start: int) -> bool:
+    """Fixed-window negation check: a ``not``/``no``/... token within ~24
+    chars before the mention. A negated mention is never repo evidence."""
+    window = text[max(0, start - 24):start]
+    return bool(_DECOMPOSE_NEGATION_RE.search(window))
+
+
+def _path_fragment_signal(after: str, local_candidates: dict[str, str]) -> bool:
+    """True when the text after a mention contains a slash-joined path
+    fragment beyond the owner/name (``repoB server/api``, ``repoB
+    (src/api: mod.rs)``) — a workspace-locator signal. A resolvable repo
+    mention in the window is NOT a fragment (``repoA and repoB`` stays bare).
+    """
+    for fm in _DECOMPOSE_SLUG_RE.finditer(after):
+        frag = fm.group(0)
+        owner, _, name = frag.partition("/")
+        if _slug_is_noise(owner, name):
+            continue
+        ident = _normalize_repo_identity(frag)
+        if ident and ident in local_candidates:
+            continue
+        return True
+    return False
+
+
+def _assertion_window(text: str, start: int, end: int, pad: int = 40) -> str:
+    return text[max(0, start - pad):end + pad]
+
+
+def _detect_alternate_repo_anchor(
+    root_ws_path: Path, children: list[dict]
+) -> dict[int, str]:
+    """Resolve each child's repo anchor from its own text, deterministically.
+
+    Runs only when the root is a worktree-kind task with a git
+    ``workspace_path``. Returns ``{child_index: repo_root_path}`` for
+    children that positively locate a DIFFERENT, locally-resolvable repo;
+    children with no locator-signalled evidence inherit the root anchor
+    (absent from the dict). Children that set an explicit
+    ``workspace_path`` are skipped entirely — an explicit anchor is never
+    second-guessed.
+
+    Raises ``ValueError`` (before any row is written) when a child names
+    two or more distinct non-root repos in a workspace-anchoring context,
+    or positively asserts a repo-shaped mention (or absolute path) that
+    cannot be resolved locally. Prose-noise tokens (``epic/61``,
+    ``wt/t_<id>``, multi-segment paths), negation-context mentions, and
+    issue references (``owner/name#<digits>``) never trigger either.
+    """
+    root_identities = _repo_identities(root_ws_path)
+
+    # Deterministic candidate set: the root's repo (implicit — every non-
+    # root identity below is compared against it), depth-1 git siblings of
+    # the root checkout, and locally-resolvable registered projects.
+    candidates: dict[str, str] = {}
+    parent = root_ws_path.parent
+    if parent.is_dir():
+        try:
+            entries = sorted(parent.iterdir(), key=lambda p: p.name)
+        except OSError:
+            entries = []
+        for d in entries:
+            if d == root_ws_path or d.is_symlink() or not d.is_dir():
+                continue
+            if not _is_git_checkout(d):
+                continue
+            for ident in _repo_identities(d):
+                if ident not in root_identities:
+                    candidates.setdefault(ident, str(_git_toplevel(d) or d))
+    try:
+        from hermes_cli import projects_db as _pdb
+        with _pdb.connect_closing() as _pconn:
+            for proj in _pdb.list_projects(_pconn):
+                for folder in proj.folders:
+                    fpath = Path(folder.path)
+                    if not fpath.is_dir() or not _is_git_checkout(fpath):
+                        continue
+                    for ident in _repo_identities(fpath) | {
+                        (proj.slug or "").lower(), (proj.name or "").lower()
+                    }:
+                        if ident and ident not in root_identities:
+                            candidates.setdefault(
+                                ident, str(_git_toplevel(fpath) or fpath)
+                            )
+    except Exception:
+        pass  # registry unavailable -> sibling + explicit-path evidence only
+
+    results: dict[int, str] = {}
+    for idx, child in enumerate(children):
+        if child.get("workspace_path"):
+            continue  # explicit per-child anchor wins; never second-guessed
+        title = str(child.get("title") or "")
+        body = child.get("body")
+        text = title + ("\n" + body if isinstance(body, str) else "")
+
+        local_candidates = dict(candidates)
+        abs_path_evidence: dict[str, str] = {}  # repo root -> display token
+        for m in _DECOMPOSE_ABS_PATH_RE.finditer(text):
+            raw = m.group(0).rstrip(".,;:)]}")
+            p = Path(raw)
+            if p.is_dir() and _is_git_checkout(p):
+                ident = next(iter(_repo_identities(p) - root_identities), None)
+                if ident is None:
+                    ident = p.name.lower()
+                if ident not in root_identities and ident:
+                    local_candidates.setdefault(ident, str(_git_toplevel(p) or p))
+                    abs_path_evidence[local_candidates[ident]] = raw
+            elif _DECOMPOSE_ASSERTION_WORDS_RE.search(
+                _assertion_window(text, m.start(), m.end())
+            ):
+                raise ValueError(
+                    f"child[{idx}] ({title.strip()!r}) names an explicit absolute "
+                    f"path {raw!r} in a workspace-anchoring context, but that path "
+                    "does not resolve to a local checkout — fix the card or "
+                    "resolve the repo"
+                )
+
+        evidence: dict[str, list[str]] = {}  # repo root -> mentioning tokens
+        unresolvable: list[str] = []
+        for m in _DECOMPOSE_SLUG_RE.finditer(text):
+            start, end = m.start(), m.end()
+            token = text[start:end]
+            if _token_is_noise(text, start, end):
+                continue
+            if _token_negated(text, start):
+                continue
+            ident = _normalize_repo_identity(token)
+            if ident is None or ident in root_identities:
+                continue
+            resolved = local_candidates.get(ident)
+            before = text[max(0, start - 40):start]
+            after = text[end:end + 70]
+            if resolved:
+                locator = bool(_DECOMPOSE_LOCATOR_WORDS_RE.search(before + " " + after))
+                if not locator:
+                    locator = _path_fragment_signal(after, local_candidates)
+                if locator:
+                    evidence.setdefault(resolved, []).append(token)
+            elif _DECOMPOSE_ASSERTION_WORDS_RE.search(before + " " + after):
+                unresolvable.append(token)
+
+        # An explicit, existing absolute path in the text is itself
+        # workspace-locator evidence for that repo.
+        for repo_root in abs_path_evidence:
+            evidence.setdefault(repo_root, []).append(abs_path_evidence[repo_root])
+
+        if unresolvable:
+            raise ValueError(
+                f"child[{idx}] ({title.strip()!r}) names repo(s) that cannot be "
+                f"resolved locally: {', '.join(sorted(set(unresolvable)))} — "
+                "fix the card or resolve the repo (clone it or register it) "
+                "before decomposing"
+            )
+        if len(evidence) > 1:
+            tokens = [t for toks in evidence.values() for t in toks]
+            raise ValueError(
+                f"child[{idx}] ({title.strip()!r}) names multiple distinct "
+                f"repositories in a workspace-anchoring context: "
+                f"{', '.join(sorted(set(tokens)))} — pin the card to one repo "
+                "or remove the ambiguity"
+            )
+        if len(evidence) == 1:
+            results[idx] = next(iter(evidence))
+    return results
 
 
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
