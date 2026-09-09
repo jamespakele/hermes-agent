@@ -142,8 +142,10 @@ def _is_cloud_placeholder_path(path: Path) -> bool:
 # restart-events table) is diagnostics, not a lifecycle command. Deliberately
 # conservative: no `awk` (system()), no `sed` (`s///e`), no `echo`/`printf`
 # (routinely piped into a shell), no `mysql` (`\\!` and `system` escapes).
+# `jq` is safe: pure JSON transform with no execution escapes (unlike awk/sed/mysql,
+# which were deliberately excluded for having them).
 _DATA_SINK_EXECUTABLES = frozenset(
-    {"grep", "egrep", "fgrep", "rg", "ag", "ack", "journalctl", "sqlite3", "psql"}
+    {"grep", "egrep", "fgrep", "rg", "ag", "ack", "journalctl", "sqlite3", "psql", "jq"}
 )
 # Argument shapes that can smuggle execution back INTO a data sink: command
 # and process substitution anywhere, sqlite3 dot-commands (`.shell ...`),
@@ -617,7 +619,14 @@ def _mask_data_sink_arguments(text: str) -> str:
                     # argument could smuggle execution back in (fail closed).
                     arguments = segment[index + 1 :]
                     if not any(
-                        argument.startswith(".")
+                        # Only sqlite3 (the only data sink with dot-commands
+                        # like `.shell`) treats a leading "." as an execution
+                        # escape; for jq the `.` is path/identity DATA and for
+                        # grep/rg/ag/ack/journalctl a leading "." is a plain
+                        # pattern. Other execution escapes (`$()`, backtick,
+                        # `<()`/`>(`, psql `\!`) are still fail-closed via
+                        # _UNSAFE_DATA_ARG_MARKERS for every sink.
+                        (executable == "sqlite3" and argument.startswith("."))
                         or any(marker in argument for marker in _UNSAFE_DATA_ARG_MARKERS)
                         for argument in arguments
                     ):

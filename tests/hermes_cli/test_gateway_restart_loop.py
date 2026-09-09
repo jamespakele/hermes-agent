@@ -1320,6 +1320,52 @@ class TestLifecycleGuardDataArgumentExemption:
         check_gateway_lifecycle(prompt, str(script))
 
 
+class TestLifecycleGuardJqDataExemption:
+    """A lifecycle phrase as a JSON string literal inside a jq filter is DATA,
+    not a command — jq is a pure JSON transform with no execution escapes.
+    The same phrase smuggled to execution (pipe/cmd-substitution/control
+    separator) must still block."""
+
+    def _scan(self, command, **kwargs):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        return contains_gateway_lifecycle_command_or_referenced_script(
+            command, **kwargs
+        )
+
+    @pytest.mark.parametrize("command", [
+        # Lifecycle phrase as a jq string literal (data, not a command). Uses
+        # the SAME phrase literals as the existing grep/sqlite tests so they
+        # hit the real regex branches: Branch A (`hermes gateway restart|stop`)
+        # and Branch C (`systemctl … hermes-gateway`).
+        'jq -r \'.items[] | select(.msg | contains("hermes gateway restart"))\' data.json',
+        'jq \'.x | select(.note | contains("hermes gateway stop"))\' f.json',
+        'jq -r \'.items[] | select(.level | contains("systemctl restart hermes-gateway"))\' log.json',
+    ])
+    def test_jq_filter_lifecycle_text_not_blocked(self, command):
+        assert self._scan(command) is False
+
+    @pytest.mark.parametrize("command", [
+        # Execution smuggled through or around jq must still block — mirrors
+        # the existing grep blocked group's structure with the executable
+        # swapped to jq.
+        'jq \'.items[] | select(.msg | contains("systemctl restart hermes-gateway"))\' f.json | sh',
+        'jq \'.items[] | select(.msg | contains("hermes gateway restart"))\' f.json | bash',
+        'jq \'.[].id\' data.json | xargs hermes gateway restart',
+        'jq "$(systemctl restart hermes-gateway)" data.json',
+        "jq `hermes gateway restart` data.json",
+        "jq '.[]' <(systemctl restart hermes-gateway)",
+        'jq \'.[]\' data.json; systemctl restart hermes-gateway',
+        'jq -r \'.[].id\' data.json; hermes gateway stop',
+        # Plain lifecycle commands are unaffected by the exemption.
+        "hermes gateway restart",
+        "sudo systemctl stop hermes-gateway",
+    ])
+    def test_jq_command_position_lifecycle_still_blocked(self, command):
+        assert self._scan(command) is True
+
+
 class TestLifecycleGuardGitCommitFlagExemption:
     """The git COMMIT-MESSAGE FLAG's VALUE is data, not a command.
 
