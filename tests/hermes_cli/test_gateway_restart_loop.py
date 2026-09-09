@@ -1354,9 +1354,45 @@ class TestLifecycleGuardGitCommitFlagExemption:
         # File-sourced message: data lives in the file, -F's path is not
         # masked and the command stays clean.
         "git commit -F message.txt",
+        # Case variants of the Branch-A phrase inside the -m value. The
+        # flag-value masker is case-insensitive (the lifecycle regex is
+        # compiled with re.I), so every casing of the foot-gun phrase is
+        # data here, never a command.
+        'git commit -m "Hermes Gateway Restart rationale"',
+        'git commit -m "HERMES GATEWAY RESTART policy"',
+        'git commit -m "HERMES GATEWAY STOP notes"',
+        # Case variants spanning multiple paragraphs: the open-quote span
+        # pre-join folds the physical lines into one data token before the
+        # per-line walk, so Title-Case / ALL-CAPS prose on a later paragraph
+        # is masked exactly like the lowercase multi-paragraph shapes above.
+        'git commit -m "Para one\n\nHermes Gateway Restart discussion"',
+        'git commit -m "HERMES GATEWAY STOP rationale\n\nsecond paragraph"',
     ])
     def test_git_commit_message_prose_not_blocked(self, command):
         assert self._scan(command) is False
+
+    def test_git_commit_message_file_content_not_blocked(self, tmp_path):
+        """A real `git commit -F <file>` whose FILE CONTENT carries Branch-A
+        prose is data, not a command.
+
+        Regression for the -F indirection: the earlier trivial case
+        (`git commit -F message.txt`) had no phrase anywhere, so it never
+        exercised the file-content path. Here the message file's content
+        contains the foot-gun phrase. HEAD behavior (verified against
+        6eb3511230): the referenced-script walk does NOT treat git's -F
+        argument as a script — git is not a shell executable, and the
+        bare-executable branch only follows slash-containing or
+        .sh/.bash/.zsh-suffixed tokens — so the file is never read and the
+        command-line scan returns False. That is the accepted fail-closed
+        posture: the guard stays unchanged, and the -F value is data, not
+        an executed command."""
+        message_file = tmp_path / "message.txt"
+        message_file.write_text(
+            "docs: explain that hermes gateway restart is blocked by design\n"
+            "and that hermes gateway stop is refused\n",
+            encoding="utf-8",
+        )
+        assert self._scan(f"git commit -F {message_file}") is False
 
     @pytest.mark.parametrize("command", [
         # Control separator before the phrase as its own standalone command.
@@ -1365,6 +1401,13 @@ class TestLifecycleGuardGitCommitFlagExemption:
         'git commit -m "hermes gateway restart" | sh',
         # Unsafe marker inside the message value disables masking.
         'git commit -m "$(hermes gateway restart)"',
+        # Backtick command substitution inside the message value: same
+        # fail-closed rule as $() — the value can smuggle execution.
+        "git commit -m `hermes gateway restart`",
+        # Masked flag value piped into a bare Branch-A command: the pipe is
+        # a command separator, so the lifecycle token is in command
+        # position and must still block.
+        'git commit -m "x" | hermes gateway restart',
         # Bare Branch-A command, no git involvement.
         "hermes gateway restart",
     ])
@@ -1479,6 +1522,10 @@ class TestLifecycleGuardKanbanFlagExemption:
         # ; -separated standalone Branch-A command beside a masked kanban call.
         'hermes kanban complete --summary "x"; hermes gateway restart',
         'hermes kanban comment --body "x"; hermes gateway stop',
+        # Masked flag value piped into a bare Branch-A command: the pipe is
+        # a command separator, so the lifecycle token is in command
+        # position and must still block.
+        'hermes kanban complete --summary "x" | hermes gateway stop',
         # Bare Branch-A command (executable == hermes, no kanban path).
         "hermes gateway restart",
         # Wrapped executable: basename is sudo, not hermes — not exempt.
