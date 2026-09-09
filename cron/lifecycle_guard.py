@@ -156,25 +156,37 @@ _UNSAFE_DATA_ARG_MARKERS = ("`", "$(", "<(", ">(", "\\!")
 _PIPE_TO_INTERPRETER = re.compile(
     r"\|\s*&?\s*(?:sudo\s+)?(?:sh|bash|dash|ksh|zsh|xargs|eval|source)\b"
 )
-# Executables that carry DATA as a single FLAG's VALUE argument rather than across the
-# whole trailing-argument position. git's commit is the canonical case:
-# `git commit -m "<prose>"` is a contribution message, never a command — but git is not
-# a position-based data sink, and the data lives in the flag's value, so the
-# position-based masker cannot cover it. Mapping: executable -> {subcommand: message
-# flags whose VALUE argument is data}. Only the VALUE of one of these flags is masked;
-# every other token is preserved (fail-closed default). Deliberately conservative: git
-# is the only entry; the executable is matched by basename, so `sudo git commit ...`
-# (executable resolves to `sudo`) is NOT exempt and stays blocked.
-# SCOPE NOTE: this masks only SINGLE-LINE flag values. A quoted value that
-# spans physical lines (a multi-paragraph `-m` message with embedded
-# newlines) is NOT exempted: `_mask_data_sink_arguments` tokenizes per line,
-# so an open quote leaves each physical line unbalanced, shlex raises, and the
-# line is skipped unmasked — the phrase inside still blocks. A proper fix is a
-# quote-aware pre-join of open-quote spans before the per-line walk; not wired
-# here to keep scope conservative in fail-closed code.
-_DATA_ARGUMENT_FLAG_VALUES: dict[str, dict[str, frozenset[str]]] = {
+# Executables that carry DATA as the VALUE of a known FLAG rather than across
+# the whole trailing-argument position. git's commit is the canonical case:
+# `git commit -m "<prose>"` is a contribution message, never a command — but git
+# is not a position-based data sink, and the data lives in the flag's value, so
+# the position-based masker cannot cover it. A `hermes kanban <verb> --body`
+# style shape is the same situation: free-text task content that may mention
+# lifecycle prose.
+#
+# Mapping: executable (matched by basename, so `sudo hermes …` resolves to
+# `sudo` and stays blocked) -> {subcommand PATH: data flags whose VALUE is data}.
+# A subcommand PATH is a tuple of the leading argument tokens; the DEEPEST
+# matching prefix wins when resolving (see `_mask_flag_data_values`), so git's
+# single-level `("commit",)` and hermes' two-level `("kanban", <verb>)` paths
+# resolve the same way. Only the VALUE of one of these flags is masked; every
+# other token is preserved (fail-closed default). Deliberately conservative:
+# only executables/verbs/flags that carry free-text DATA and have no execution
+# escapes here.
+#
+# Multi-paragraph QUOTED flag values (a `-m` message spanning physical lines)
+# are joined into one data token before the per-line walk by
+# `_prejoin_open_quote_spans`; an unclosed quote there fails closed and keeps
+# blocking.
+_DATA_ARGUMENT_FLAG_VALUES: dict[str, dict[tuple[str, ...], frozenset[str]]] = {
     "git": {
-        "commit": frozenset({"-m", "--message", "-am"}),
+        ("commit",): frozenset({"-m", "--message", "-am"}),
+    },
+    "hermes": {
+        ("kanban", "complete"): frozenset({"--summary", "--result"}),
+        ("kanban", "comment"): frozenset({"--body"}),
+        ("kanban", "create"): frozenset({"--body"}),
+        ("kanban", "edit"): frozenset({"--summary", "--result"}),
     },
 }
 
@@ -242,10 +254,14 @@ def _mask_flag_data_values(
 
     Some executables carry DATA in a specific FLAG's value argument rather than
     in the whole trailing-argument position. Only the value of a known data
-    flag is masked; every other token passes through untouched. Returns None
-    when no masking applies or the segment fails closed (an unsafe
-    execution-capable marker anywhere in the value), so the caller keeps the
-    original text — masking can only ever ALLOW, never block.
+    flag is masked; every other token passes through untouched. The flag map
+    keys on the leading SUBCOMMAND PATH (a tuple of leading argument tokens);
+    the DEEPEST matching prefix wins, so git's single-level paths and hermes'
+    two-level ``kanban <verb>`` paths both resolve. Returns None when no
+    masking applies or the segment fails closed (an unsafe execution-capable
+    marker anywhere in the segment, or a known flag with a missing value), so
+    the caller keeps the original text — masking can only ever ALLOW, never
+    block. Both ``--flag VALUE`` and ``--flag=VALUE`` forms are masked.
     """
     arguments = segment[command_index + 1 :]
     if not arguments:
@@ -253,29 +269,37 @@ def _mask_flag_data_values(
     flag_map = _DATA_ARGUMENT_FLAG_VALUES.get(Path(segment[command_index]).name)
     if flag_map is None:
         return None
-    flags = flag_map.get(arguments[0])  # arguments[0] is the subcommand ("commit")
-    if flags is None:
+    max_depth = max((len(path) for path in flag_map), default=0)
+    flag_path: Optional[tuple[str, ...]] = None
+    for depth in range(min(len(arguments), max_depth), 0, -1):
+        candidate = tuple(arguments[:depth])
+        if candidate in flag_map:
+            flag_path = candidate
+            break
+    if flag_path is None:
         return None
-    rebuilt: list[str] = []
+    flags = flag_map[flag_path]
+    remaining = arguments[len(flag_path) :]
+    rebuilt: list[str] = list(flag_path)
     masked = False
     i = 0
-    while i < len(arguments):
-        token = arguments[i]
+    while i < len(remaining):
+        token = remaining[i]
         if any(marker in token for marker in _UNSAFE_DATA_ARG_MARKERS):
             return None  # fail closed: leave the whole segment unmasked
-        if token.startswith("--message="):
-            prefix, _, _ = token.partition("=")
-            rebuilt.append(f"{prefix}=arg")
+        prefix, sep, _ = token.partition("=")
+        if sep and prefix in flags:
+            rebuilt.append(f"{prefix}=arg")  # --flag=VALUE form
             masked = True
             i += 1
             continue
         if token in flags:
-            if i + 1 >= len(arguments) or any(
-                marker in arguments[i + 1] for marker in _UNSAFE_DATA_ARG_MARKERS
+            if i + 1 >= len(remaining) or any(
+                marker in remaining[i + 1] for marker in _UNSAFE_DATA_ARG_MARKERS
             ):
-                return None
+                return None  # missing value or unsafe value: fail closed
             rebuilt.append(token)
-            rebuilt.append("arg")
+            rebuilt.append("arg")  # --flag VALUE form
             masked = True
             i += 2
             continue
@@ -284,7 +308,6 @@ def _mask_flag_data_values(
     if not masked:
         return None
     return segment[: command_index + 1] + rebuilt
-
 
 def contains_launchctl_submit_command(command: str) -> bool:
     """Detect an executed ``launchctl submit``/``bootstrap``, not quoted text.
@@ -305,6 +328,77 @@ def contains_launchctl_submit_command(command: str) -> bool:
             if arguments and arguments[0].lower() in {"submit", "bootstrap"}:
                 return True
     return False
+
+
+def _scan_line_quote_state(line: str, quote: Optional[str]) -> Optional[str]:
+    """Return the quote char still open at end of *line*, or None if balanced.
+
+    Mirrors shlex's POSIX rules for quote-boundary purposes only: outside
+    quotes a backslash escapes the next character (so an escaped quote there
+    is literal, not an opener); inside double quotes a backslash escapes the
+    next character; inside single quotes nothing is escaped. Any disagreement
+    vs. shlex is fail-closed: an over-extended span keeps the prose in the
+    joined line (so a real command is never hidden by masking), and an
+    under-joined span leaves a line shlex rejects, which the per-line walk
+    skips unmasked.
+    """
+    j = 0
+    while j < len(line):
+        ch = line[j]
+        if quote is None:
+            if ch == "\\":
+                j += 2
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+        elif ch == quote:
+            quote = None
+        elif quote == '"' and ch == "\\":
+            j += 2
+            continue
+        j += 1
+    return quote
+
+
+def _prejoin_open_quote_spans(text: str) -> str:
+    """Join physical lines that fall inside an open quote span into one line.
+
+    ``_mask_data_sink_arguments`` tokenizes one physical line at a time, so a
+    quoted flag VALUE that spans physical lines (a multi-paragraph
+    ``git commit -m`` message) leaves each line quote-unbalanced: shlex
+    raises, the line is skipped unmasked, and the data still blocks. This
+    helper folds each open-quote span into a SINGLE physical line (interior
+    newlines folded to a space) so the per-line walk sees one balanced quote
+    and one data token. Fail-closed: if a quote never closes by end of text
+    the input is returned unchanged and the per-line walk's unbalanced-quote
+    skip keeps the plain-regex verdict. Text with no multi-line span is
+    returned untouched, so single-line output is byte-identical.
+    """
+    lines = text.splitlines() or [text]
+    if len(lines) < 2:
+        return text
+    rebuilt: list[str] = []
+    i = 0
+    joined = False
+    while i < len(lines):
+        quote = _scan_line_quote_state(lines[i], None)
+        if quote is None:
+            rebuilt.append(lines[i])
+            i += 1
+            continue
+        j = i + 1
+        while j < len(lines):
+            if _scan_line_quote_state(lines[j], quote) is None:
+                break
+            j += 1
+        if j >= len(lines):
+            return text  # quote never closes: fail closed, leave untouched
+        rebuilt.append(" ".join(lines[i : j + 1]))
+        joined = True
+        i = j + 1
+    if not joined:
+        return text
+    return "\n".join(rebuilt)
 
 
 def _mask_data_sink_arguments(text: str) -> str:
@@ -331,10 +425,14 @@ def _mask_data_sink_arguments(text: str) -> str:
     regex-matching text in place) whenever the line pipes into a shell or
     interpreter, any argument carries an execution-capable marker
     (substitution, sqlite3 ``.``-commands, psql ``\\!``), or the line cannot
-    be tokenized at all. Masking can therefore only ever ALLOW a command the
-    plain regex would have blocked — never block one it would have allowed —
-    so it runs solely as a second-pass exemption check.
+    be tokenized at all. Before tokenizing, open-quote spans that cross
+    physical lines are folded into a single logical line by
+    ``_prejoin_open_quote_spans`` (an unclosed quote fails closed and leaves
+    the text to keep blocking). Masking can therefore only ever ALLOW a command
+    the plain regex would have blocked — never block one it would have
+    allowed — so it runs solely as a second-pass exemption check.
     """
+    text = _prejoin_open_quote_spans(text)
     lines_out: list[str] = []
     changed = False
     for line in text.splitlines() or [text]:

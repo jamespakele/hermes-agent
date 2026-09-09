@@ -1374,25 +1374,101 @@ class TestLifecycleGuardGitCommitFlagExemption:
     def test_plain_commit_message_without_phrase_unaffected(self):
         assert self._scan('git commit -m "fix the flaky test"') is False
 
-    def test_multiline_commit_message_is_known_limitation(self):
-        """KNOWN LIMITATION: a multi-paragraph `-m` message whose quoted
-        value spans physical lines is NOT yet exempted — the per-line masker
-        hits an unbalanced-quote ValueError and skips the line unmasked, so
-        Branch-A prose on a later line of the message still blocks. This
-        keeps the single-line scope of the flag-value exemption honest; the
-        proper fix is a quote-aware pre-join of open-quote spans before the
-        per-line walk.
-        """
-        from cron.lifecycle_guard import _DATA_ARGUMENT_FLAG_VALUES
-        assert _DATA_ARGUMENT_FLAG_VALUES["git"]["commit"] == frozenset(
-            {"-m", "--message", "-am"}
-        )
+    def test_multiline_commit_message_prose_not_blocked(self):
+        """A quoted -m value spanning physical lines is joined into one data
+        token before the per-line walk, so Branch-A prose on a later line of
+        the message is masked like single-line prose."""
         command = (
             'git commit -m "para one\n\n'
             "hermes gateway restart discussion"
             '"'
         )
+        assert self._scan(command) is False
+
+    def test_multiline_commit_message_prose_across_paragraphs_not_blocked(self):
+        command = (
+            'git commit -m "hermes gateway stop rationale\n\n'
+            "second paragraph"
+            '"'
+        )
+        assert self._scan(command) is False
+
+    def test_multiline_commit_message_unclosed_quote_still_blocked(self):
+        """Fail closed: an open quote that never closes leaves the text to the
+        per-line walk's unbalanced-quote skip, so the prose still blocks."""
+        command = (
+            'git commit -m "para one\n\n'
+            "hermes gateway restart discussion"
+        )
         assert self._scan(command) is True
+
+
+class TestLifecycleGuardKanbanFlagExemption:
+    """The kanban TASK-DATA FLAG VALUES are data, not commands.
+
+    `hermes kanban complete --summary/--result`, `comment --body`,
+    `create --body`, and `edit --summary/--result` carry free-text task
+    content that may legitimately mention Branch-A prose. Mirrors the git
+    flag-value exemption: only known-flag VALUES are masked; the same words
+    in command position, behind a pipe, with execution-capable markers, or
+    under an unclosed quote still block.
+    """
+
+    def _scan(self, command, **kwargs):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        return contains_gateway_lifecycle_command_or_referenced_script(
+            command, **kwargs
+        )
+
+    @pytest.mark.parametrize("command", [
+        # Spaced --flag VALUE forms for every enumerated subcommand/flag pair.
+        'hermes kanban complete --summary "explain that hermes gateway restart is blocked by design"',
+        'hermes kanban complete --result "hermes gateway stop rationale"',
+        'hermes kanban comment --body "review note: hermes gateway restart was discussed"',
+        'hermes kanban create --body "ticket: hermes gateway stop policy"',
+        'hermes kanban edit --summary "handoff: hermes gateway restart completed"',
+        'hermes kanban edit --result "hermes gateway stop backfill"',
+        # --flag=VALUE equals forms for each subcommand/flag pair.
+        'hermes kanban complete --summary="why hermes gateway stop is refused"',
+        'hermes kanban complete --result="hermes gateway restart docs"',
+        'hermes kanban comment --body="hermes gateway restart Q&A"',
+        'hermes kanban create --body="hermes gateway stop notes"',
+        'hermes kanban edit --summary="hermes gateway restart summary"',
+        'hermes kanban edit --result="hermes gateway stop result"',
+        # Repeated flags on one command line: each known value masked.
+        'hermes kanban complete --summary "restart done" --result "hermes gateway stop rationale"',
+        # Two-level subcommand path with a multi-paragraph quoted value.
+        'hermes kanban complete --summary "para one\n\nhermes gateway stop discussion"',
+    ])
+    def test_kanban_flag_value_prose_not_blocked(self, command):
+        assert self._scan(command) is False
+
+    @pytest.mark.parametrize("command", [
+        # Unsafe markers smuggled into the value disable masking (fail closed).
+        'hermes kanban complete --summary "$(hermes gateway restart)"',
+        "hermes kanban complete --result `hermes gateway restart`",
+        # Pipe-to-interpreter: fail-closed plain-regex verdict.
+        'hermes kanban complete --summary "hermes gateway restart" | sh',
+        # ; -separated standalone Branch-A command beside a masked kanban call.
+        'hermes kanban complete --summary "x"; hermes gateway restart',
+        'hermes kanban comment --body "x"; hermes gateway stop',
+        # Bare Branch-A command (executable == hermes, no kanban path).
+        "hermes gateway restart",
+        # Wrapped executable: basename is sudo, not hermes — not exempt.
+        'sudo hermes kanban complete --summary "hermes gateway restart prose"',
+        # Unclosed quote: pre-join fails closed, prose still blocks.
+        'hermes kanban create --body "hermes gateway restart',
+    ])
+    def test_kanban_flag_value_in_command_position_still_blocked(self, command):
+        assert self._scan(command) is True
+
+    def test_plain_kanban_summary_without_phrase_unaffected(self):
+        assert (
+            self._scan('hermes kanban complete --summary "fix the flaky test"')
+            is False
+        )
 
 
 class TestLifecycleGuardNeverRaises:
