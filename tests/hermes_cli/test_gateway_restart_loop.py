@@ -560,6 +560,121 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 0
         assert calls == ["systemctl status nginx"]
 
+    @pytest.mark.parametrize("command", [
+        # Inline commit-message flag value carries Branch-A prose as prose.
+        'git commit -m "explain that hermes gateway restart is blocked by design"',
+        # -am combined short-form commit flag.
+        'git commit -am "docs: note hermes gateway stop policy"',
+        # --message spaced form.
+        'git commit --message "the guard blocks hermes gateway restart"',
+        # --message=value equals form.
+        'git commit --message="why hermes gateway stop is refused"',
+        # Repeated -m: only the message values hold the phrase.
+        'git commit -m "add restart docs" -m "hermes gateway restart rationale"',
+        # File-sourced message: data lives in the file, -F's path is not
+        # masked and the command stays clean.
+        "git commit -F message.txt",
+        # Case variants of the Branch-A phrase inside the -m value. The
+        # flag-value masker is case-insensitive (the lifecycle regex is
+        # compiled with re.I), so every casing of the foot-gun phrase is
+        # data here, never a command.
+        'git commit -m "Hermes Gateway Restart rationale"',
+        'git commit -m "HERMES GATEWAY RESTART policy"',
+        'git commit -m "HERMES GATEWAY STOP notes"',
+        # Case variants spanning multiple paragraphs: the open-quote span
+        # pre-join folds the physical lines into one data token before the
+        # per-line walk, so Title-Case / ALL-CAPS prose on a later paragraph
+        # is masked exactly like the lowercase multi-paragraph shapes above.
+        'git commit -m "Para one\n\nHermes Gateway Restart discussion"',
+        'git commit -m "HERMES GATEWAY STOP rationale\n\nsecond paragraph"',
+    ])
+    def test_git_commit_message_flag_prose_passes_through(self, monkeypatch, command):
+        """Branch-A prose inside git commit-message flag VALUES is DATA at the
+        terminal enforcement site: the command must reach env.execute verbatim
+        instead of being lifecycle-blocked."""
+        import tools.terminal_tool as tt
+
+        calls = []
+
+        class _FakeEnv:
+            env = {}
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 0
+        assert calls == [command]
+
+    @pytest.mark.parametrize("command", [
+        # Spaced --flag VALUE forms for every enumerated subcommand/flag pair.
+        'hermes kanban complete --summary "explain that hermes gateway restart is blocked by design"',
+        'hermes kanban complete --result "hermes gateway stop rationale"',
+        'hermes kanban comment --body "review note: hermes gateway restart was discussed"',
+        'hermes kanban create --body "ticket: hermes gateway stop policy"',
+        'hermes kanban edit --summary "handoff: hermes gateway restart completed"',
+        'hermes kanban edit --result "hermes gateway stop backfill"',
+        # --flag=VALUE equals forms for each subcommand/flag pair.
+        'hermes kanban complete --summary="why hermes gateway stop is refused"',
+        'hermes kanban complete --result="hermes gateway restart docs"',
+        'hermes kanban comment --body="hermes gateway restart Q&A"',
+        'hermes kanban create --body="hermes gateway stop notes"',
+        'hermes kanban edit --summary="hermes gateway restart summary"',
+        'hermes kanban edit --result="hermes gateway stop result"',
+        # Repeated flags on one command line: each known value masked.
+        'hermes kanban complete --summary "restart done" --result "hermes gateway stop rationale"',
+        # Two-level subcommand path with a multi-paragraph quoted value.
+        'hermes kanban complete --summary "para one\n\nhermes gateway stop discussion"',
+    ])
+    def test_kanban_task_data_flag_prose_passes_through(self, monkeypatch, command):
+        """Branch-A prose inside kanban task-data flag VALUES (--summary,
+        --result, --body) is DATA at the terminal enforcement site: the
+        command must reach env.execute verbatim instead of being
+        lifecycle-blocked."""
+        import tools.terminal_tool as tt
+
+        calls = []
+
+        class _FakeEnv:
+            env = {}
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 0
+        assert calls == [command]
+
+    def test_masked_data_shape_then_standalone_lifecycle_command_still_blocked(
+        self, monkeypatch
+    ):
+        """Fail closed at the enforcement site: a masked git -m data shape
+        followed by a standalone Branch-A command (semicolon-separated) is a
+        lifecycle command in command position and must be blocked BEFORE
+        anything executes — env.execute is never reached."""
+        import tools.terminal_tool as tt
+
+        command = 'git commit -m "merge docs"; hermes gateway restart'
+
+        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 1
+        assert "Blocked" in result["error"]
+
 
 # ---------------------------------------------------------------------------
 # cron.lifecycle_guard module — the shared checker create_job/CLI/terminal use
