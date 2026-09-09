@@ -941,21 +941,36 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
-    def test_oversized_remote_callback_text_fails_closed(self):
-        """T4: >1 MiB of NUL-free text from a remote callback must follow the
-        local-read contract (oversized regular file → fail closed, #76762)
-        instead of being scanned unbounded — the 179 MiB case from #77729."""
+    def test_oversized_remote_callback_text_prefix_scanned(self):
+        """T4: >1 MiB of NUL-free text from a remote callback is truncated
+        to a bounded byte-prefix and scanned — mirroring the oversized
+        local-read contract (t_1ad00f81) instead of fail-closed (#76762's
+        remote arm; the unbounded-scan concern from #77729 stays covered by
+        the prefix bound). A lifecycle command inside the prefix still
+        blocks through the same remote-read path."""
         from cron.lifecycle_guard import (
             _MAX_REFERENCED_SCRIPT_BYTES,
             contains_gateway_lifecycle_command_or_referenced_script,
         )
 
-        big = "x" * (_MAX_REFERENCED_SCRIPT_BYTES + 1)
+        big_clean = "x" * (_MAX_REFERENCED_SCRIPT_BYTES + 1)
 
         result = contains_gateway_lifecycle_command_or_referenced_script(
             "bash /nonexistent/dir/big_helper.sh",
             cwd="/tmp",
-            read_remote_script=lambda _path: big,
+            read_remote_script=lambda _path: big_clean,
+        )
+        assert result is False
+
+        big_bad = (
+            "hermes gateway restart\n"
+            + "x" * (_MAX_REFERENCED_SCRIPT_BYTES + 1)
+        )
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "bash /nonexistent/dir/big_helper.sh",
+            cwd="/tmp",
+            read_remote_script=lambda _path: big_bad,
         )
         assert result is True
 
@@ -1421,3 +1436,121 @@ class TestLifecycleGuardNeverRaises:
         if os.name != "nt":
             with pytest.raises(GatewayLifecycleBlocked):
                 check_gateway_lifecycle("clean prompt", "/dev/null")
+
+
+class TestOversizedTextReferencedScriptPrefixScan:
+    """t_1ad00f81: oversized TEXT referenced-scripts are prefix-scanned.
+
+    A bun-compiled coding-agent shim (~/.bun/bin/omp) is a 21 MB printable
+    JS bundle: no binary magic, no NUL bytes — so the reference walk read it
+    as a shell script, hit the 1 MiB cap, failed closed, and blocked every
+    direct-path invocation of the shim from inside the gateway. Oversized
+    text files now get their first _MAX_REFERENCED_SCRIPT_BYTES scanned
+    instead; a lifecycle command inside that prefix is still blocked.
+    """
+
+    def _oversized_file(self, tmp_path, name, head=""):
+        from cron.lifecycle_guard import _MAX_REFERENCED_SCRIPT_BYTES
+
+        filler = "echo filler-line\n" * 200000
+        path = tmp_path / name
+        path.write_text(head + filler, encoding="utf-8")
+        assert path.stat().st_size > _MAX_REFERENCED_SCRIPT_BYTES
+        return path
+
+    def test_oversized_clean_text_script_passes(self, tmp_path):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        path = self._oversized_file(tmp_path, "big.sh")
+        assert (
+            contains_gateway_lifecycle_command_or_referenced_script(
+                str(path), cwd=str(tmp_path)
+            )
+            is False
+        )
+
+    def test_oversized_script_with_lifecycle_command_in_prefix_blocks(
+        self, tmp_path
+    ):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        path = self._oversized_file(
+            tmp_path, "big.sh", head="#!/bin/bash\nhermes gateway restart\n"
+        )
+        assert (
+            contains_gateway_lifecycle_command_or_referenced_script(
+                str(path), cwd=str(tmp_path)
+            )
+            is True
+        )
+
+    def test_cron_oversized_clean_script_does_not_raise(self, tmp_path):
+        from cron.lifecycle_guard import check_gateway_lifecycle
+
+        path = self._oversized_file(tmp_path, "big.sh")
+        check_gateway_lifecycle("clean prompt", str(path))  # must not raise
+
+    def test_cron_oversized_script_with_command_in_prefix_raises(
+        self, tmp_path
+    ):
+        from cron.lifecycle_guard import (
+            GatewayLifecycleBlocked,
+            check_gateway_lifecycle,
+        )
+        path = self._oversized_file(
+            tmp_path, "big.sh", head="#!/bin/bash\nhermes gateway restart\n"
+        )
+        with pytest.raises(GatewayLifecycleBlocked):
+            check_gateway_lifecycle("clean prompt", str(path))
+
+    def test_cron_oversized_script_with_launchctl_submit_raises(
+        self, tmp_path
+    ):
+        from cron.lifecycle_guard import (
+            GatewayLifecycleBlocked,
+            check_gateway_lifecycle,
+        )
+        head = (
+            "#!/bin/bash\n"
+            "launchctl submit -l ai.hermes.loop -- /bin/true\n"
+        )
+        path = self._oversized_file(tmp_path, "big.sh", head=head)
+        with pytest.raises(GatewayLifecycleBlocked):
+            check_gateway_lifecycle("clean prompt", str(path))
+
+    def test_bun_shim_shape_passes(self, tmp_path):
+        """The reported shape: `#!/usr/bin/env bun` + minified JS bundle."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        head = "#!/usr/bin/env bun\n// @bun\nvar x=1;process.title='omp';\n"
+        path = self._oversized_file(tmp_path, "omp", head=head)
+        assert (
+            contains_gateway_lifecycle_command_or_referenced_script(
+                f"{path} --version", cwd=str(tmp_path)
+            )
+            is False
+        )
+
+    def test_shell_interpreted_oversized_script_also_prefix_scanned(
+        self, tmp_path
+    ):
+        """`bash X` / `source X` of an oversized clean text file pass too.
+
+        The prefix scan lives at the shared read choke point
+        (_read_referenced_script), so all three yield shapes get identical
+        treatment. A lifecycle command in the prefix still blocks in every
+        shape — see the blocking tests above."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        path = self._oversized_file(tmp_path, "big.sh")
+        for command in (f"source {path}", f"bash {path}"):
+            assert (
+                contains_gateway_lifecycle_command_or_referenced_script(
+                    command, cwd=str(tmp_path)
+                )
+                is False
+            )

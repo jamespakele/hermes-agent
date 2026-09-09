@@ -525,7 +525,36 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     if b"\x00" in data:
         return None, False
     if len(data) > _MAX_REFERENCED_SCRIPT_BYTES:
-        return None, True
+        # Oversized TEXT file (already passed the binary-magic and NUL-byte
+        # sniffs above): hand back a bounded prefix for scanning instead of
+        # failing closed. Failing closed here false-positived every oversized
+        # non-shell text bundle executed by direct path — e.g. bun-compiled
+        # coding-agent shims like `~/.bun/bin/omp` (a 21 MB printable-JS
+        # bundle behind a `#!/usr/bin/env bun` shebang: no ELF/PE/Mach-O
+        # magic, no NULs) — so the walk classified the shim as an "oversized
+        # shell script", returned unsafe, and blocked every invocation of it
+        # from inside the gateway (t_1ad00f81). The first
+        # _MAX_REFERENCED_SCRIPT_BYTES still get the full lifecycle scan, so
+        # a real `hermes gateway restart` / `launchctl submit` line in the
+        # referenced file is still blocked. A lifecycle command buried past
+        # the cap in a >1 MiB file is an accepted residual: this guard is
+        # defense-in-depth against agent-driven restart loops, not a security
+        # boundary, and the shell (or runtime) that ultimately executes the
+        # file reads it with no cap at all.
+        #
+        # Measured cost of scanning the 1 MiB prefix of a minified-JS bundle
+        # (t_1ad00f81): ~52 ms for the lifecycle regex, ~4 s total for the
+        # walk's three shlex tokenizations (submit scan, `-c` payload scan,
+        # referenced-script scan). Accepted: it is paid once per command that
+        # references an oversized file, and the alternative — memoizing the
+        # tokenization — was evaluated and rejected because the cache would
+        # pin multi-MB token tuples in the long-lived gateway process.
+        return (
+            data[:_MAX_REFERENCED_SCRIPT_BYTES].decode(
+                "utf-8", errors="replace"
+            ),
+            False,
+        )
     return data.decode("utf-8", errors="replace"), False
 
 
@@ -536,13 +565,14 @@ def _sanitize_remote_script_text(text: Optional[str]) -> tuple[Optional[str], bo
     Modal, Daytona, or a future one) can hand back raw binary bytes decoded
     as text, or arbitrarily large output. Mirror
     ``_read_referenced_script``'s semantics exactly — NUL bytes mean binary
-    (nothing to scan, checked first, #77703), oversized text fails closed
-    like an oversized local file (#76762) — so remote and local reads can
+    (nothing to scan, checked first, #77703), oversized text is truncated
+    to a bounded byte-prefix for scanning exactly like an oversized local
+    file (t_1ad00f81) — so remote and local reads can
     never diverge again. The size check re-encodes to compare *bytes*
     (matching the local read and the ``head -c`` wire bound): a >1 MiB
     multibyte file truncated at the byte cap decodes to fewer characters
-    than bytes, and a character-count check would scan the truncated text
-    instead of failing closed. Enforced here rather than inside each
+    than bytes, so the *byte*-prefix slice (never a character-count slice)
+    is what gets scanned. Enforced here rather than inside each
     callback so the guarantee holds for every callback, not just the ones
     we hardened.
     """
@@ -550,8 +580,22 @@ def _sanitize_remote_script_text(text: Optional[str]) -> tuple[Optional[str], bo
         return None, False
     if "\x00" in text:
         return None, False
-    if len(text.encode("utf-8", errors="replace")) > _MAX_REFERENCED_SCRIPT_BYTES:
-        return None, True
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) > _MAX_REFERENCED_SCRIPT_BYTES:
+        # Oversized TEXT (already passed the NUL-byte check above): hand
+        # back a bounded byte-prefix for scanning instead of failing
+        # closed — mirrors _read_referenced_script's oversized-text
+        # contract (t_1ad00f81) so a remote backend executing an oversized
+        # non-shell text bundle (e.g. a bun-compiled coding-agent shim)
+        # by path is not false-positived either. A lifecycle command
+        # inside the prefix still blocks; one buried past the cap is the
+        # same accepted residual as the local path.
+        return (
+            encoded[:_MAX_REFERENCED_SCRIPT_BYTES].decode(
+                "utf-8", errors="replace"
+            ),
+            False,
+        )
     return text, False
 
 
