@@ -183,13 +183,20 @@ _PIPE_TO_INTERPRETER = re.compile(
 # the `git config <key> <value>` shape. The key is an unbounded dotted
 # identifier, so a flag-based leaf cannot name it; the masker skips known
 # boolean `git config` options, treats the first positional as the preserved
-# key, and masks the following token as data. Values git EXECUTES later are
-# never data and never masked: keys whose stored value is a command line
-# (`alias.*`, `core.editor`, `core.pager`, `core.fsmonitor`, `filter.*`), any
-# value starting with `!` (git's shell-exec escape), and query/unset/
-# section-edit verbs that have no value slot at all all fail closed instead
-# of masking — masking those shapes can only launder a deferred execution or
-# destroy a real token sequence, never enable a legitimate setter.
+# key, and masks the following token as data. Classification is
+# ALLOWLIST-BY-DEFAULT (round-3 review): the value slot is masked only when
+# the key is audited inert data (`_is_data_git_config_key` — `user.*`,
+# `branch.*`). Every other key fails closed, because git documents far more
+# command-bearing keys than any denylist reliably enumerated (round 2
+# missed nothing its probe knew; round 3 found core.sshCommand,
+# diff.external, pager.*, gpg.program, credential.helper — plus dynamic
+# families diff.<driver>.command, merge.<driver>.driver,
+# credential.<url>.helper, mergetool.<tool>.cmd, difftool.<tool>.cmd,
+# gpg.<x>.program, core.askPass). Also never masked: any value starting
+# with `!` (git's shell-exec escape), and query/unset/section-edit verbs
+# that have no value slot at all — masking those shapes can only launder a
+# deferred execution or destroy a real token sequence, never enable a
+# legitimate setter.
 #
 # Multi-paragraph QUOTED flag values (a `-m` message spanning physical lines)
 # are joined into one data token before the per-line walk by
@@ -221,7 +228,13 @@ _GIT_CONFIG_NO_VALUE_VERBS = frozenset({
     "--remove-section", "--rename-section",
     "--edit", "-e",
 })
-# git config KEYS whose stored VALUE git later executes as a command line:
+# git config KEYS whose stored VALUE git later executes as a command line.
+# RETAINED as a defensive second layer even though the classification below
+# is now allowlist-by-default: any key that matched this denylist was never
+# data, and keeping it explicit documents the audited command-bearing
+# families (round-2 review) and keeps that guarantee independent of the
+# allowlist's contents.
+#
 # `alias.*` (the `!` shell escape runs it via the shell on a bare
 # `git <alias>`), `core.editor` / `core.pager` (spawned on git's behalf),
 # `core.fsmonitor` and `filter.*` (hook-style helpers). Masking those values
@@ -230,10 +243,13 @@ _GIT_CONFIG_NO_VALUE_VERBS = frozenset({
 # allowed string — so they fail closed instead of masking (round-2 review of
 # the data-argument masker).
 #
-# Other executable-value keys exist (core.sshCommand, credential.helper,
-# gpg.program, pager.*, diff.*.command, merge.*.driver); they stay outside
-# this reviewed list — extend only with a reproduction and a probe, keeping
-# the leaf's allow surface as narrow as the false-positive evidence requires.
+# The denylist approach did not scale: git documents MORE command-bearing
+# keys than any enumerated list reliably covered (round-3 review found
+# core.sshCommand, core.askPass, diff.external, diff.<driver>.command,
+# merge.<driver>.driver, pager.<cmd>, gpg.program, gpg.<x>.program,
+# credential.helper, credential.<url>.helper, mergetool.<tool>.cmd,
+# difftool.<tool>.cmd — all executable with plain prose values, no `!`
+# prefix). See _GIT_CONFIG_DATA_KEY_PREFIXES below for the inversion.
 _GIT_CONFIG_EXECUTABLE_KEY_PREFIXES = ("alias.", "filter.")
 _GIT_CONFIG_EXECUTABLE_KEYS = frozenset({
     "core.editor", "core.pager", "core.fsmonitor",
@@ -248,6 +264,34 @@ def _is_executable_git_config_key(key: str) -> bool:
     return any(
         lowered.startswith(prefix)
         for prefix in _GIT_CONFIG_EXECUTABLE_KEY_PREFIXES
+    )
+
+
+# ALLOWLIST-BY-DEFAULT inversion (round-3 review, option (a)): the
+# ``git config <key> <value>`` value slot is masked as inert DATA only for
+# keys on this audited non-executable list; EVERY other key fails closed
+# (returns None so the plain-regex verdict decides). git's documented
+# command-bearing key families are open-ended (dynamic `<driver>`/`<tool>`/
+# `<url>` namespaces git can register at runtime), so a denylist provably
+# missed documented keys twice; inverting puts the burden on the data side,
+# where the set of keys git treats as pure stored text is small, stable, and
+# enumerable. `user.*` (author identity/comment fields) and `branch.*` are
+# the audited data families; extend only with a documentation citation and
+# a probe. branch.* audit: every documented branch.<name>.* value is a ref
+# name (`remote`, `merge`), a boolean/list (`rebase`, `mergeoptions`,
+# `pushOptions`), or free-text description — none is ever executed as a
+# command, unlike sibling namespaces that ARE executable (e.g.
+# `remote.<name>.uploadpack`, a program git runs through the remote
+# shell), which is why scoping stays prefix-allowlist and never "any key".
+_GIT_CONFIG_DATA_KEY_PREFIXES = ("user.", "branch.")
+
+
+def _is_data_git_config_key(key: str) -> bool:
+    """True for ``git config`` keys whose stored VALUE is inert text."""
+    lowered = key.lower()
+    return any(
+        lowered.startswith(prefix)
+        for prefix in _GIT_CONFIG_DATA_KEY_PREFIXES
     )
 _DATA_ARGUMENT_FLAG_VALUES: dict[str, object] = {
     "git": {
@@ -337,13 +381,17 @@ def _mask_positional_data_value(
 
     ``remaining`` is the post-subcommand-walk argument tokens: the first
     positional is the KEY (preserved), the NEXT token is the free-text VALUE
-    (masked). Only known boolean ``git config`` options may precede the key;
-    query/unset/-l verbs, unknown or value-taking options, keys whose stored
-    value git executes later (``alias.*``, ``core.editor``, ``core.pager``,
-    ``core.fsmonitor``, ``filter.*``), any ``!``-prefixed value (git's
-    shell-exec escape), extra positional tokens past ``<key> <value>``, and
-    any unsafe marker all fail closed (return None so the caller keeps the
-    raw segment — masking only ever ALLOWS).
+    (masked, allowlist-by-default: only audited inert-data keys — ``user.*``,
+    ``branch.*`` — are masked). Only known boolean ``git config`` options may
+    precede the key; query/unset/-l verbs, unknown or value-taking options,
+    keys whose stored value git executes later (``alias.*``, ``core.editor``,
+    ``core.pager``, ``core.fsmonitor``, ``filter.*`` — retained as a defensive
+    second layer), every key not on the audited data allowlist, any
+    ``!``-prefixed value (git's shell-exec escape — checked before the
+    allowlist so it fails closed on allowlisted keys too), extra positional
+    tokens past ``<key> <value>``, and any unsafe marker all fail closed
+    (return None so the caller keeps the raw segment — masking only ever
+    ALLOWS).
     """
     if any(
         any(marker in token for marker in _UNSAFE_DATA_ARG_MARKERS)
@@ -361,14 +409,28 @@ def _mask_positional_data_value(
         return None  # unknown / value-taking option: fail closed
     if i + 1 >= len(remaining):
         return None  # key only, no value to mask
-    # An EXECUTABLE config value (alias `!` escape, editor/pager/filter
-    # command lines) is argument-as-COMMAND, not argument-as-data: masking
-    # it would allow a deferred execution chain (`git config alias.bang
-    # '!<cmd>'` followed later by `git bang`). Fail closed.
+    # A `!`-prefixed value is git's shell-exec escape on ANY key —
+    # allowlisted or not — so it is checked BEFORE the allowlist: an
+    # allowlisted key must never mask an executable value.
+    if remaining[i + 1].startswith("!"):
+        return None
+    # Defensive denylist layer (round-2 audit): keys whose stored value git
+    # documents as a command line (`alias.*`, `core.editor`, `core.pager`,
+    # `core.fsmonitor`, `filter.*`) never mask, independent of the
+    # allowlist below.
     if _is_executable_git_config_key(remaining[i]):
         return None
-    if remaining[i + 1].startswith("!"):
-        return None  # `!` prefix is git's shell-exec escape on any value
+    # Allowlist-by-default (round-3 review): the value slot masks only for
+    # audited inert-data keys (`user.*`, `branch.*`). git's documented
+    # command-bearing key families are open-ended — core.sshCommand,
+    # core.askPass, diff.external, diff.<driver>.command,
+    # merge.<driver>.driver, pager.<cmd>, gpg.program, gpg.<x>.program,
+    # credential.helper, credential.<url>.helper, mergetool.<tool>.cmd,
+    # difftool.<tool>.cmd — and a denylist provably missed documented keys
+    # twice, so EVERY key not explicitly audited as data fails closed
+    # (returning None keeps the raw segment and the plain-regex verdict).
+    if not _is_data_git_config_key(remaining[i]):
+        return None
     # Anything past `<key> <value>` is either an invalid command or a
     # value-pattern form; masking on such shapes can only destroy a real
     # token sequence, never help a legitimate setter. Fail closed.
