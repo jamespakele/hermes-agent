@@ -181,7 +181,13 @@ _PIPE_TO_INTERPRETER = re.compile(
 # the `git config <key> <value>` shape. The key is an unbounded dotted
 # identifier, so a flag-based leaf cannot name it; the masker skips known
 # boolean `git config` options, treats the first positional as the preserved
-# key, and masks the following token as data.
+# key, and masks the following token as data. Values git EXECUTES later are
+# never data and never masked: keys whose stored value is a command line
+# (`alias.*`, `core.editor`, `core.pager`, `core.fsmonitor`, `filter.*`), any
+# value starting with `!` (git's shell-exec escape), and query/unset/
+# section-edit verbs that have no value slot at all all fail closed instead
+# of masking — masking those shapes can only launder a deferred execution or
+# destroy a real token sequence, never enable a legitimate setter.
 #
 # Multi-paragraph QUOTED flag values (a `-m` message spanning physical lines)
 # are joined into one data token before the per-line walk by
@@ -202,6 +208,45 @@ _GIT_CONFIG_BOOLEAN_OPTIONS = frozenset({
     "--name-only", "--show-origin", "--show-scope", "--show-secrets",
     "--edit", "-e", "--includes", "--no-includes",
 })
+# git config VERB options that make a value slot impossible (queries, unsets,
+# section edits): when one is present there is no ``<key> <value>`` pair to
+# mask, and "masking" the token after the key on such shapes silently
+# destroys a genuine token sequence (fail-open). Fail closed instead.
+_GIT_CONFIG_NO_VALUE_VERBS = frozenset({
+    "--get", "--get-all", "--get-regexp", "--get-urlmatch",
+    "--list", "-l",
+    "--unset", "--unset-all",
+    "--remove-section", "--rename-section",
+    "--edit", "-e",
+})
+# git config KEYS whose stored VALUE git later executes as a command line:
+# `alias.*` (the `!` shell escape runs it via the shell on a bare
+# `git <alias>`), `core.editor` / `core.pager` (spawned on git's behalf),
+# `core.fsmonitor` and `filter.*` (hook-style helpers). Masking those values
+# as inert data would launder a deferred execution — `git config alias.bang
+# '!<prose>' && git bang` defines AND invokes a lifecycle command in one
+# allowed string — so they fail closed instead of masking (round-2 review of
+# the data-argument masker).
+#
+# Other executable-value keys exist (core.sshCommand, credential.helper,
+# gpg.program, pager.*, diff.*.command, merge.*.driver); they stay outside
+# this reviewed list — extend only with a reproduction and a probe, keeping
+# the leaf's allow surface as narrow as the false-positive evidence requires.
+_GIT_CONFIG_EXECUTABLE_KEY_PREFIXES = ("alias.", "filter.")
+_GIT_CONFIG_EXECUTABLE_KEYS = frozenset({
+    "core.editor", "core.pager", "core.fsmonitor",
+})
+
+
+def _is_executable_git_config_key(key: str) -> bool:
+    """True for ``git config`` keys whose stored VALUE git executes later."""
+    lowered = key.lower()
+    if lowered in _GIT_CONFIG_EXECUTABLE_KEYS:
+        return True
+    return any(
+        lowered.startswith(prefix)
+        for prefix in _GIT_CONFIG_EXECUTABLE_KEY_PREFIXES
+    )
 _DATA_ARGUMENT_FLAG_VALUES: dict[str, object] = {
     "git": {
         "commit": frozenset({"-m", "--message", "-am"}),
@@ -291,9 +336,12 @@ def _mask_positional_data_value(
     ``remaining`` is the post-subcommand-walk argument tokens: the first
     positional is the KEY (preserved), the NEXT token is the free-text VALUE
     (masked). Only known boolean ``git config`` options may precede the key;
-    query/unset/-l forms, unknown or value-taking options, and any unsafe
-    marker fail closed (return None so the caller keeps the raw segment —
-    masking only ever ALLOWS).
+    query/unset/-l verbs, unknown or value-taking options, keys whose stored
+    value git executes later (``alias.*``, ``core.editor``, ``core.pager``,
+    ``core.fsmonitor``, ``filter.*``), any ``!``-prefixed value (git's
+    shell-exec escape), extra positional tokens past ``<key> <value>``, and
+    any unsafe marker all fail closed (return None so the caller keeps the
+    raw segment — masking only ever ALLOWS).
     """
     if any(
         any(marker in token for marker in _UNSAFE_DATA_ARG_MARKERS)
@@ -302,16 +350,31 @@ def _mask_positional_data_value(
         return None
     i = 0
     while i < len(remaining) and remaining[i] in _GIT_CONFIG_BOOLEAN_OPTIONS:
+        if remaining[i] in _GIT_CONFIG_NO_VALUE_VERBS:
+            return None  # query/unset verb: no value slot exists to mask
         i += 1
     if i >= len(remaining):
         return None  # only options, no key
     if remaining[i].startswith("-"):
         return None  # unknown / value-taking option: fail closed
     if i + 1 >= len(remaining):
-        return None  # query form: no value to mask
+        return None  # key only, no value to mask
+    # An EXECUTABLE config value (alias `!` escape, editor/pager/filter
+    # command lines) is argument-as-COMMAND, not argument-as-data: masking
+    # it would allow a deferred execution chain (`git config alias.bang
+    # '!<cmd>'` followed later by `git bang`). Fail closed.
+    if _is_executable_git_config_key(remaining[i]):
+        return None
+    if remaining[i + 1].startswith("!"):
+        return None  # `!` prefix is git's shell-exec escape on any value
+    # Anything past `<key> <value>` is either an invalid command or a
+    # value-pattern form; masking on such shapes can only destroy a real
+    # token sequence, never help a legitimate setter. Fail closed.
+    if any(not token.startswith("-") for token in remaining[i + 2 :]):
+        return None
     rebuilt.extend(remaining[: i + 1])  # options + key preserved
     rebuilt.append("arg")  # the value: masked
-    rebuilt.extend(remaining[i + 2 :])  # trailing args preserved
+    rebuilt.extend(remaining[i + 2 :])  # trailing option tokens preserved
     return segment[: command_index + 1] + rebuilt
 
 

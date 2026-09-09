@@ -1674,6 +1674,41 @@ class TestLifecycleGuardGitConfigFlagExemption:
     def test_git_config_value_in_command_position_still_blocked(self, command):
         assert self._scan(command) is True
 
+    @pytest.mark.parametrize("command", [
+        # git EXECUTES alias values later (`git bang` -> shell); the
+        # define-and-invoke one-liner does both in one allowed string.
+        "git config alias.bang '!hermes gateway restart'",
+        "git config --global alias.bang '!hermes gateway restart'",
+        "git config alias.bang '!hermes gateway restart' && git bang",
+        # core.editor/pager/fsmonitor and filter.* are command lines git
+        # runs on its own behalf.
+        'git config core.editor "hermes gateway restart"',
+        'git config core.pager "hermes gateway restart"',
+        'git config core.fsmonitor "hermes gateway restart"',
+        'git config filter.smudge "hermes gateway restart"',
+        # Bare `!` is git's shell-exec escape on ANY value, denylisted
+        # key or not.
+        "git config user.bang '!hermes gateway restart'",
+        # Query verbs have no value slot; masking the token after the
+        # key would only destroy a real token sequence (extra positional
+        # or pattern argument).
+        "git config --get user.name hermes gateway restart",
+        "git config --get-regexp 'hermes gateway restart'",
+        'git config section.key "hermes gateway restart" extra',
+    ])
+    def test_git_config_executable_value_still_blocked(self, command):
+        assert self._scan(command) is True
+
+    def test_git_config_prose_value_without_exec_markers_still_allowed(self):
+        # The `!` rule is a VALUE-PREFIX rule and the denylist is
+        # KEY-scoped: ordinary prose in a normal setter still passes.
+        assert self._scan(
+            "git config user.bang 'notes on hermes gateway restart'"
+        ) is False
+        assert self._scan(
+            'git config user.note "see hermes gateway restart docs"'
+        ) is False
+
     def test_git_config_query_forms_and_plain_values_unaffected(self):
         assert self._scan('git config user.name') is False
         assert self._scan("git config -l") is False
