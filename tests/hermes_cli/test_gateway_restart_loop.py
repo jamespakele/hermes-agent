@@ -1823,14 +1823,20 @@ class TestLifecycleGuardGitNotesFlagExemption:
 
 
 class TestLifecycleGuardGitConfigFlagExemption:
-    """The git CONFIG VALUE (token after the key) is data, not a command.
+    """The git CONFIG VALUE (token after the key) is data ONLY for audited keys.
 
     `git config <key> "<prose>"` stores free-text config data in a positional
     VALUE slot — a third leaf kind (`_POSITIONAL_DATA_VALUE`) in the flag map.
+    Allowlist-by-default (round-3 review): the value token is masked ONLY for
+    audited inert-data keys (`user.*`, `branch.*`); EVERY other key —
+    including git's documented command-bearing families (core.sshCommand,
+    diff.external, pager.*, gpg.program, credential.helper and their dynamic
+    <driver>/<tool>/<url> namespaces) and any unknown key — fails closed.
     Only the boolean option run up to the first positional key is skipped, the
     key is preserved, and the NEXT token is masked. Query/unset/list forms,
-    unknown or value-taking options, command-position placement, pipes,
-    markers, and sudo-wrapping all still block (fail closed).
+    unknown or value-taking options (which fail closed even for allowlisted
+    keys), `!`-prefixed values, command-position placement, pipes, markers,
+    and sudo-wrapping all still block (fail closed).
     """
 
     def _scan(self, command, **kwargs):
@@ -1844,10 +1850,14 @@ class TestLifecycleGuardGitConfigFlagExemption:
     @pytest.mark.parametrize("command", [
         'git config branch.main.notes "explain that hermes gateway restart is blocked by design"',
         'git config --global user.notes "hermes gateway stop rationale"',
-        'git config --add section.key "hermes gateway restart discussion"',
-        'git config --replace-all section.key "why hermes gateway stop is refused"',
+        # Allowlist-by-default (round-3): prose masking survives only on the
+        # audited inert-data key families (user.*, branch.*). The last two
+        # cases previously used a generic section.key, which now fails
+        # closed by default like every unaudited key.
+        'git config --add user.notes "hermes gateway restart discussion"',
+        'git config --replace-all user.notes "why hermes gateway stop is refused"',
     ])
-    def test_git_config_value_prose_not_blocked(self, command):
+    def test_git_config_prose_value_in_audited_data_keys_not_blocked(self, command):
         assert self._scan(command) is False
 
     @pytest.mark.parametrize("command", [
@@ -1884,6 +1894,60 @@ class TestLifecycleGuardGitConfigFlagExemption:
     ])
     def test_git_config_executable_value_still_blocked(self, command):
         assert self._scan(command) is True
+
+    @pytest.mark.parametrize("command", [
+        # Round-3 review: git documents MORE command-bearing keys than any
+        # denylist enumerated (the round-2 list missed these six probed
+        # shapes plus the dynamic families). Allowlist-by-default means
+        # plain prose (no `!`) in every UNAUDITED key's value slot fails
+        # closed. The first two re-probe the reviewer's S1/S2 exactly.
+        'git config core.sshCommand "hermes gateway restart"',
+        'git config --global core.sshCommand "hermes gateway restart"',
+        'git config core.askPass "hermes gateway restart"',
+        'git config diff.external "hermes gateway restart"',
+        'git config diff.mydriver.command "hermes gateway restart"',
+        'git config merge.mydriver.driver "hermes gateway restart"',
+        'git config pager.diff "hermes gateway restart"',
+        'git config pager.log "hermes gateway restart"',
+        'git config gpg.program "hermes gateway restart"',
+        'git config gpg.ssh.program "hermes gateway restart"',
+        'git config credential.helper "hermes gateway restart"',
+        'git config credential.https://example.com.helper "hermes gateway restart"',
+        'git config mergetool.mine.cmd "hermes gateway restart"',
+        'git config difftool.mine.cmd "hermes gateway restart"',
+        # Behavior-change pin: an unaudited GENERIC key fails closed by
+        # default even for innocent prose. (The two former ALLOW cases for
+        # this key moved to the audited user.notes allowlist test above.)
+        'git config section.key "hermes gateway restart discussion"',
+    ])
+    def test_git_config_unaudited_key_prose_fails_closed(self, command):
+        assert self._scan(command) is True
+
+    @pytest.mark.parametrize("command", [
+        # --file is a value-taking option (not in _GIT_CONFIG_BOOLEAN_OPTIONS):
+        # fail closed even for an allowlisted key.
+        'git config --file /tmp/other.cfg user.notes "hermes gateway restart prose"',
+        # --file variant of the SAME classification (round-3 checklist): an
+        # executable key behind a value-taking option fails closed for two
+        # independent reasons (option not maskable AND key not allowlisted).
+        'git config --file /tmp/other.cfg core.sshCommand "hermes gateway restart"',
+        # Multi-paragraph value: the quote-aware pre-join folds the span into
+        # one token, but core.sshCommand is not on the audited data allowlist,
+        # so the value is never masked and the prose blocks.
+        'git config core.sshCommand "para one\n\nhermes gateway restart discussion"',
+        'git config --global core.sshCommand "para one\n\nhermes gateway restart discussion"',
+    ])
+    def test_git_config_option_and_multiline_variants_fail_closed(self, command):
+        assert self._scan(command) is True
+
+    def test_git_config_data_key_allowlist_scoping(self):
+        from cron.lifecycle_guard import _is_data_git_config_key
+        assert _is_data_git_config_key("user.name")
+        assert _is_data_git_config_key("USER.NAME")  # case-insensitive
+        assert _is_data_git_config_key("branch.main.notes")
+        assert not _is_data_git_config_key("core.sshCommand")
+        assert not _is_data_git_config_key("section.key")
+        assert not _is_data_git_config_key("user")  # bare section, no dot
 
     def test_git_config_prose_value_without_exec_markers_still_allowed(self):
         # The `!` rule is a VALUE-PREFIX rule and the denylist is
