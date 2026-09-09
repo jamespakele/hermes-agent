@@ -1320,7 +1320,6 @@ class TestLifecycleGuardDataArgumentExemption:
         check_gateway_lifecycle(prompt, str(script))
 
 
-
 class TestLifecycleGuardGitCommitFlagExemption:
     """The git COMMIT-MESSAGE FLAG's VALUE is data, not a command.
 
@@ -1541,6 +1540,191 @@ class TestLifecycleGuardKanbanFlagExemption:
             self._scan('hermes kanban complete --summary "fix the flaky test"')
             is False
         )
+
+
+class TestLifecycleGuardGitTagFlagExemption:
+    """The git TAG-MESSAGE FLAG's VALUE is data, not a command.
+
+    `git tag -m "<prose>"` is an annotated-tag message, never an executed
+    lifecycle command — same data-slot shape as `git commit -m`. Mirrors the
+    commit exemption: only the message-flag VALUE is masked; the same words
+    in command position, behind a pipe, with execution-capable markers, under
+    an unclosed quote, or with a sudo-wrapped executable all still block.
+    """
+
+    def _scan(self, command, **kwargs):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        return contains_gateway_lifecycle_command_or_referenced_script(
+            command, **kwargs
+        )
+
+    @pytest.mark.parametrize("command", [
+        'git tag -m "explain that hermes gateway restart is blocked by design"',
+        'git tag -m "hermes gateway stop is refused" v1.2.3',
+        'git tag -a -m "annotate: hermes gateway restart discussion" v1.2.3',
+        'git tag --message "the guard blocks hermes gateway restart"',
+        'git tag --message="why hermes gateway stop is refused"',
+        'git tag -m "add restart docs" -m "hermes gateway restart rationale"',
+        "git tag -F tagmsg.txt",
+    ])
+    def test_git_tag_message_prose_not_blocked(self, command):
+        assert self._scan(command) is False
+
+    @pytest.mark.parametrize("command", [
+        'git tag -m "$(hermes gateway restart)"',
+        'git tag -m "merge docs"; hermes gateway restart',
+        'git tag -m "hermes gateway restart" | sh',
+        'sudo git tag -m "hermes gateway restart prose"',
+        "hermes gateway restart",
+    ])
+    def test_git_tag_message_prose_in_command_position_still_blocked(self, command):
+        assert self._scan(command) is True
+
+    def test_plain_tag_message_without_phrase_unaffected(self):
+        assert self._scan('git tag -m "release v1.2.3"') is False
+
+    def test_git_tag_flag_map_unchanged(self):
+        from cron.lifecycle_guard import _DATA_ARGUMENT_FLAG_VALUES
+        assert _DATA_ARGUMENT_FLAG_VALUES["git"]["tag"] == frozenset({"-m", "--message"})
+
+
+class TestLifecycleGuardGitNotesFlagExemption:
+    """The git NOTES ADD-MESSAGE FLAG's VALUE is data, not a command.
+
+    `git notes add -m "<prose>"` is a note body, never an executed lifecycle
+    command — same flag-value slot as `git commit -m`. The notes subcommand is
+    a two-level path (git -> notes -> add), mirroring how
+    `hermes kanban <verb>` resolves in the flag map. Only the message value
+    is masked; command position, pipes, markers, sudo-wrapping, and unclosed
+    quotes still block.
+    """
+
+    def _scan(self, command, **kwargs):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        return contains_gateway_lifecycle_command_or_referenced_script(
+            command, **kwargs
+        )
+
+    @pytest.mark.parametrize("command", [
+        'git notes add -m "see hermes gateway restart"',
+        'git notes add -m "hermes gateway stop rationale" HEAD',
+        'git notes add --message "notes mention hermes gateway restart"',
+        'git notes add --message="hermes gateway stop policy" HEAD',
+    ])
+    def test_git_notes_message_prose_not_blocked(self, command):
+        assert self._scan(command) is False
+
+    @pytest.mark.parametrize("command", [
+        'git notes add -m "$(hermes gateway restart)"',
+        'git notes add -m "note"; hermes gateway restart',
+        'git notes add -m "hermes gateway restart" | sh',
+        'sudo git notes add -m "hermes gateway restart prose"',
+        "hermes gateway restart",
+    ])
+    def test_git_notes_message_prose_in_command_position_still_blocked(self, command):
+        assert self._scan(command) is True
+
+    def test_plain_notes_message_without_phrase_unaffected(self):
+        assert self._scan('git notes add -m "typo fix"') is False
+
+    def test_git_notes_flag_map_unchanged(self):
+        from cron.lifecycle_guard import _DATA_ARGUMENT_FLAG_VALUES
+        assert _DATA_ARGUMENT_FLAG_VALUES["git"]["notes"]["add"] == frozenset({"-m", "--message"})
+
+
+class TestLifecycleGuardGitConfigFlagExemption:
+    """The git CONFIG VALUE (token after the key) is data, not a command.
+
+    `git config <key> "<prose>"` stores free-text config data in a positional
+    VALUE slot — a third leaf kind (`_POSITIONAL_DATA_VALUE`) in the flag map.
+    Only the boolean option run up to the first positional key is skipped, the
+    key is preserved, and the NEXT token is masked. Query/unset/list forms,
+    unknown or value-taking options, command-position placement, pipes,
+    markers, and sudo-wrapping all still block (fail closed).
+    """
+
+    def _scan(self, command, **kwargs):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        return contains_gateway_lifecycle_command_or_referenced_script(
+            command, **kwargs
+        )
+
+    @pytest.mark.parametrize("command", [
+        'git config branch.main.notes "explain that hermes gateway restart is blocked by design"',
+        'git config --global user.notes "hermes gateway stop rationale"',
+        'git config --add section.key "hermes gateway restart discussion"',
+        'git config --replace-all section.key "why hermes gateway stop is refused"',
+    ])
+    def test_git_config_value_prose_not_blocked(self, command):
+        assert self._scan(command) is False
+
+    @pytest.mark.parametrize("command", [
+        'git config section.key "$(hermes gateway restart)"',
+        'git config section.key "x"; hermes gateway restart',
+        'git config --global section.key "hermes gateway restart" | sh',
+        'sudo git config --global user.notes "hermes gateway restart prose"',
+        "hermes gateway restart",
+    ])
+    def test_git_config_value_in_command_position_still_blocked(self, command):
+        assert self._scan(command) is True
+
+    def test_git_config_query_forms_and_plain_values_unaffected(self):
+        assert self._scan('git config user.name') is False
+        assert self._scan("git config -l") is False
+        assert self._scan('git config --global user.name "Alice Hacker"') is False
+
+    def test_git_config_positional_leaf_registered(self):
+        from cron.lifecycle_guard import _DATA_ARGUMENT_FLAG_VALUES, _POSITIONAL_DATA_VALUE
+        assert _DATA_ARGUMENT_FLAG_VALUES["git"]["config"] is _POSITIONAL_DATA_VALUE
+
+
+class TestLifecycleGuardHermesToolCallFlagExemption:
+    """The hermes delegate_task PROMPT flag's VALUE is LLM input, not a command.
+
+    `hermes delegate_task --prompt "<prose>"` mirrors the `hermes kanban <verb>`
+    exemption: the prompt argument is free-text LLM input carried as a flag
+    VALUE, so only that value is masked. Same fail-closed rules apply: command
+    position, pipes, execution-capable markers, sudo-wrapping, and unclosed
+    quotes still block.
+    """
+
+    def _scan(self, command, **kwargs):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        return contains_gateway_lifecycle_command_or_referenced_script(
+            command, **kwargs
+        )
+
+    @pytest.mark.parametrize("command", [
+        'hermes delegate_task --prompt "summarize the hermes gateway restart incident"',
+        'hermes delegate_task --prompt="explain hermes gateway stop policy"',
+    ])
+    def test_delegate_prompt_prose_not_blocked(self, command):
+        assert self._scan(command) is False
+
+    @pytest.mark.parametrize("command", [
+        'hermes delegate_task --prompt "$(hermes gateway restart)"',
+        'hermes delegate_task --prompt "x"; hermes gateway restart',
+        'hermes delegate_task --prompt "hermes gateway restart" | sh',
+        'sudo hermes delegate_task --prompt "hermes gateway restart prose"',
+        "hermes gateway restart",
+    ])
+    def test_delegate_prompt_in_command_position_still_blocked(self, command):
+        assert self._scan(command) is True
+
+    def test_plain_delegate_prompt_without_phrase_unaffected(self):
+        assert self._scan('hermes delegate_task --prompt "summarize the incident"') is False
+
+    def test_hermes_delegate_flag_map_unchanged(self):
+        from cron.lifecycle_guard import _DATA_ARGUMENT_FLAG_VALUES
+        assert _DATA_ARGUMENT_FLAG_VALUES["hermes"]["delegate_task"] == frozenset({"--prompt"})
 
 
 class TestLifecycleGuardNeverRaises:

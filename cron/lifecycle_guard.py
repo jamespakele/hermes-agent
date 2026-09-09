@@ -164,25 +164,52 @@ _PIPE_TO_INTERPRETER = re.compile(
 # style shape is the same situation: free-text task content that may mention
 # lifecycle prose.
 #
-# Mapping: executable (matched by basename, so `sudo hermes …` resolves to
 # `sudo` and stays blocked) -> a nested data-flag table. Each value is EITHER a
 # frozenset of flag names (a leaf: these flags' VALUE args are data at this
 # subcommand level) OR a dict {subcommand token: next level}.
 # `_mask_flag_data_values` walks the dict levels by consuming the leading
 # argument tokens until it reaches a frozenset leaf, so git's single-level
-# `commit` subcommand and hermes' two-level `kanban <verb>` subcommands both
-# resolve to their flag set. Only the VALUE of one of these flags is masked;
-# every other token is preserved (fail-closed default). Deliberately
-# conservative: only executables/verbs/flags that carry free-text DATA and have
-# no execution escapes here.
+# `commit` / `tag` subcommands, the two-level `notes add` subcommand, and
+# hermes' `kanban <verb>` / `delegate_task` subcommands all resolve to their
+# flag set. Only the VALUE of one of these flags is masked; every other token
+# is preserved (fail-closed default). Deliberately conservative: only
+# executables/verbs/flags that carry free-text DATA and have no execution
+# escapes here.
+#
+# A THIRD leaf kind, `_POSITIONAL_DATA_VALUE`, handles slots where the DATA
+# value is the token AFTER the first positional KEY rather than a flag value —
+# the `git config <key> <value>` shape. The key is an unbounded dotted
+# identifier, so a flag-based leaf cannot name it; the masker skips known
+# boolean `git config` options, treats the first positional as the preserved
+# key, and masks the following token as data.
 #
 # Multi-paragraph QUOTED flag values (a `-m` message spanning physical lines)
 # are joined into one data token before the per-line walk by
 # `_prejoin_open_quote_spans`; an unclosed quote there fails closed and keeps
 # blocking.
+_POSITIONAL_DATA_VALUE = object()
+
+# Boolean (value-less) `git config` option tokens allowed between the `config`
+# subcommand and the first positional KEY. An option with a VALUE of its own
+# (--file/-f, --blob, --type, --default, --comment, or an equals form like
+# --type=bool) is NOT listed — seeing one fails closed (no masking).
+_GIT_CONFIG_BOOLEAN_OPTIONS = frozenset({
+    "--global", "--system", "--local", "--worktree",
+    "--add", "--replace-all", "--unset", "--unset-all",
+    "--remove-section", "--rename-section",
+    "--get", "--get-all", "--get-regexp", "--get-urlmatch",
+    "--list", "-l", "--fixed-value", "--null", "-z",
+    "--name-only", "--show-origin", "--show-scope", "--show-secrets",
+    "--edit", "-e", "--includes", "--no-includes",
+})
 _DATA_ARGUMENT_FLAG_VALUES: dict[str, object] = {
     "git": {
         "commit": frozenset({"-m", "--message", "-am"}),
+        "tag": frozenset({"-m", "--message"}),
+        "notes": {
+            "add": frozenset({"-m", "--message"}),
+        },
+        "config": _POSITIONAL_DATA_VALUE,
     },
     "hermes": {
         "kanban": {
@@ -191,6 +218,7 @@ _DATA_ARGUMENT_FLAG_VALUES: dict[str, object] = {
             "create": frozenset({"--body"}),
             "edit": frozenset({"--summary", "--result"}),
         },
+        "delegate_task": frozenset({"--prompt"}),
     },
 }
 
@@ -251,6 +279,42 @@ def _command_token_index(segment: list[str]) -> Optional[int]:
     return None
 
 
+def _mask_positional_data_value(
+    segment: list[str],
+    command_index: int,
+    consumed: int,
+    remaining: list[str],
+    rebuilt: list[str],
+) -> Optional[list[str]]:
+    """Mask the DATA VALUE of a ``git config <key> <value>`` shape.
+
+    ``remaining`` is the post-subcommand-walk argument tokens: the first
+    positional is the KEY (preserved), the NEXT token is the free-text VALUE
+    (masked). Only known boolean ``git config`` options may precede the key;
+    query/unset/-l forms, unknown or value-taking options, and any unsafe
+    marker fail closed (return None so the caller keeps the raw segment —
+    masking only ever ALLOWS).
+    """
+    if any(
+        any(marker in token for marker in _UNSAFE_DATA_ARG_MARKERS)
+        for token in remaining
+    ):
+        return None
+    i = 0
+    while i < len(remaining) and remaining[i] in _GIT_CONFIG_BOOLEAN_OPTIONS:
+        i += 1
+    if i >= len(remaining):
+        return None  # only options, no key
+    if remaining[i].startswith("-"):
+        return None  # unknown / value-taking option: fail closed
+    if i + 1 >= len(remaining):
+        return None  # query form: no value to mask
+    rebuilt.extend(remaining[: i + 1])  # options + key preserved
+    rebuilt.append("arg")  # the value: masked
+    rebuilt.extend(remaining[i + 2 :])  # trailing args preserved
+    return segment[: command_index + 1] + rebuilt
+
+
 def _mask_flag_data_values(
     segment: list[str], command_index: int
 ) -> Optional[list[str]]:
@@ -261,8 +325,12 @@ def _mask_flag_data_values(
     flag is masked; every other token passes through untouched. The flag map
     keys the executable (matched by basename) to a nested table: a dict level
     consumes the next leading argument token as the subcommand key, walked
-    until a frozenset leaf is reached — so git's single-level ``commit`` and
-    hermes' two-level ``kanban <verb>`` paths both resolve. Returns None when no
+    until a frozenset leaf is reached — so git's single-level ``commit`` /
+    ``tag``, the two-level ``notes add`` subcommand, and hermes'
+    ``kanban <verb>`` / ``delegate_task`` subcommands resolve to their flag set.
+    A third leaf kind, ``_POSITIONAL_DATA_VALUE`` (the ``git config <key>
+    <value>`` shape), masks the token after the first positional key rather
+    than a flag value. Returns None when no
     masking applies or the segment fails closed (an unsafe execution-capable
     marker anywhere in the segment, or a known flag with a missing value), so
     the caller keeps the original text — masking can only ever ALLOW, never
@@ -287,10 +355,14 @@ def _mask_flag_data_values(
             return None
         node = child
         consumed += 1
-    flags = node  # frozenset leaf
+    flags = node  # frozenset leaf, or the _POSITIONAL_DATA_VALUE sentinel
     remaining = arguments[consumed:]
     rebuilt: list[str] = list(arguments[:consumed])
     masked = False
+    if flags is _POSITIONAL_DATA_VALUE:
+        return _mask_positional_data_value(
+            segment, command_index, consumed, remaining, rebuilt
+        )
     i = 0
     while i < len(remaining):
         token = remaining[i]
