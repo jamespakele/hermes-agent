@@ -1320,6 +1320,81 @@ class TestLifecycleGuardDataArgumentExemption:
         check_gateway_lifecycle(prompt, str(script))
 
 
+
+class TestLifecycleGuardGitCommitFlagExemption:
+    """The git COMMIT-MESSAGE FLAG's VALUE is data, not a command.
+
+    `git commit -m "<prose>"` was a live false positive (Sep 2026): the
+    contribution message carries Branch-A prose (``hermes gateway
+    restart`` / ``hermes gateway stop``) but is never an executed lifecycle
+    command. The flag-value masker exempts only the message-flag VALUE; the
+    same words in real command position (or smuggled via a pipe/marker) must
+    still block.
+    """
+
+    def _scan(self, command, **kwargs):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        return contains_gateway_lifecycle_command_or_referenced_script(
+            command, **kwargs
+        )
+
+    @pytest.mark.parametrize("command", [
+        # Inline commit-message flag value carries Branch-A prose as prose.
+        'git commit -m "explain that hermes gateway restart is blocked by design"',
+        # -am combined short-form commit flag.
+        'git commit -am "docs: note hermes gateway stop policy"',
+        # --message spaced form.
+        'git commit --message "the guard blocks hermes gateway restart"',
+        # --message=value equals form.
+        'git commit --message="why hermes gateway stop is refused"',
+        # Repeated -m: only the message values hold the phrase.
+        'git commit -m "add restart docs" -m "hermes gateway restart rationale"',
+        # File-sourced message: data lives in the file, -F's path is not
+        # masked and the command stays clean.
+        "git commit -F message.txt",
+    ])
+    def test_git_commit_message_prose_not_blocked(self, command):
+        assert self._scan(command) is False
+
+    @pytest.mark.parametrize("command", [
+        # Control separator before the phrase as its own standalone command.
+        'git commit -m "merge docs"; hermes gateway restart',
+        # Message piped into a shell: fail-closed, plain-regex verdict.
+        'git commit -m "hermes gateway restart" | sh',
+        # Unsafe marker inside the message value disables masking.
+        'git commit -m "$(hermes gateway restart)"',
+        # Bare Branch-A command, no git involvement.
+        "hermes gateway restart",
+    ])
+    def test_git_commit_message_prose_in_command_position_still_blocked(self, command):
+        assert self._scan(command) is True
+
+    def test_plain_commit_message_without_phrase_unaffected(self):
+        assert self._scan('git commit -m "fix the flaky test"') is False
+
+    def test_multiline_commit_message_is_known_limitation(self):
+        """KNOWN LIMITATION: a multi-paragraph `-m` message whose quoted
+        value spans physical lines is NOT yet exempted — the per-line masker
+        hits an unbalanced-quote ValueError and skips the line unmasked, so
+        Branch-A prose on a later line of the message still blocks. This
+        keeps the single-line scope of the flag-value exemption honest; the
+        proper fix is a quote-aware pre-join of open-quote spans before the
+        per-line walk.
+        """
+        from cron.lifecycle_guard import _DATA_ARGUMENT_FLAG_VALUES
+        assert _DATA_ARGUMENT_FLAG_VALUES["git"]["commit"] == frozenset(
+            {"-m", "--message", "-am"}
+        )
+        command = (
+            'git commit -m "para one\n\n'
+            "hermes gateway restart discussion"
+            '"'
+        )
+        assert self._scan(command) is True
+
+
 class TestLifecycleGuardNeverRaises:
     """The guard must return a verdict for every input — binary referenced
     paths, NUL bytes, non-UTF-8, /dev/* nodes, directories, missing files —

@@ -156,6 +156,27 @@ _UNSAFE_DATA_ARG_MARKERS = ("`", "$(", "<(", ">(", "\\!")
 _PIPE_TO_INTERPRETER = re.compile(
     r"\|\s*&?\s*(?:sudo\s+)?(?:sh|bash|dash|ksh|zsh|xargs|eval|source)\b"
 )
+# Executables that carry DATA as a single FLAG's VALUE argument rather than across the
+# whole trailing-argument position. git's commit is the canonical case:
+# `git commit -m "<prose>"` is a contribution message, never a command — but git is not
+# a position-based data sink, and the data lives in the flag's value, so the
+# position-based masker cannot cover it. Mapping: executable -> {subcommand: message
+# flags whose VALUE argument is data}. Only the VALUE of one of these flags is masked;
+# every other token is preserved (fail-closed default). Deliberately conservative: git
+# is the only entry; the executable is matched by basename, so `sudo git commit ...`
+# (executable resolves to `sudo`) is NOT exempt and stays blocked.
+# SCOPE NOTE: this masks only SINGLE-LINE flag values. A quoted value that
+# spans physical lines (a multi-paragraph `-m` message with embedded
+# newlines) is NOT exempted: `_mask_data_sink_arguments` tokenizes per line,
+# so an open quote leaves each physical line unbalanced, shlex raises, and the
+# line is skipped unmasked — the phrase inside still blocks. A proper fix is a
+# quote-aware pre-join of open-quote spans before the per-line walk; not wired
+# here to keep scope conservative in fail-closed code.
+_DATA_ARGUMENT_FLAG_VALUES: dict[str, dict[str, frozenset[str]]] = {
+    "git": {
+        "commit": frozenset({"-m", "--message", "-am"}),
+    },
+}
 
 # Executable-image magic numbers: ELF, PE/COFF, Mach-O (universal + thin,
 # both endiannesses). A referenced file starting with one of these is a
@@ -214,6 +235,57 @@ def _command_token_index(segment: list[str]) -> Optional[int]:
     return None
 
 
+def _mask_flag_data_values(
+    segment: list[str], command_index: int
+) -> Optional[list[str]]:
+    """Mask the VALUE argument of flagged data shapes (e.g. ``git commit -m``).
+
+    Some executables carry DATA in a specific FLAG's value argument rather than
+    in the whole trailing-argument position. Only the value of a known data
+    flag is masked; every other token passes through untouched. Returns None
+    when no masking applies or the segment fails closed (an unsafe
+    execution-capable marker anywhere in the value), so the caller keeps the
+    original text — masking can only ever ALLOW, never block.
+    """
+    arguments = segment[command_index + 1 :]
+    if not arguments:
+        return None
+    flag_map = _DATA_ARGUMENT_FLAG_VALUES.get(Path(segment[command_index]).name)
+    if flag_map is None:
+        return None
+    flags = flag_map.get(arguments[0])  # arguments[0] is the subcommand ("commit")
+    if flags is None:
+        return None
+    rebuilt: list[str] = []
+    masked = False
+    i = 0
+    while i < len(arguments):
+        token = arguments[i]
+        if any(marker in token for marker in _UNSAFE_DATA_ARG_MARKERS):
+            return None  # fail closed: leave the whole segment unmasked
+        if token.startswith("--message="):
+            prefix, _, _ = token.partition("=")
+            rebuilt.append(f"{prefix}=arg")
+            masked = True
+            i += 1
+            continue
+        if token in flags:
+            if i + 1 >= len(arguments) or any(
+                marker in arguments[i + 1] for marker in _UNSAFE_DATA_ARG_MARKERS
+            ):
+                return None
+            rebuilt.append(token)
+            rebuilt.append("arg")
+            masked = True
+            i += 2
+            continue
+        rebuilt.append(token)
+        i += 1
+    if not masked:
+        return None
+    return segment[: command_index + 1] + rebuilt
+
+
 def contains_launchctl_submit_command(command: str) -> bool:
     """Detect an executed ``launchctl submit``/``bootstrap``, not quoted text.
 
@@ -251,8 +323,10 @@ def _mask_data_sink_arguments(text: str) -> str:
     executable is a known data sink (``_DATA_SINK_EXECUTABLES``), replaces
     every argument with ``arg``. The caller then re-runs the lifecycle regex
     on the masked text: a match that survives masking sits OUTSIDE any data
-    argument and is a real command.
-
+    argument and is a real command. Executables that carry DATA in a single
+    FLAG's VALUE argument (``git commit -m "..."``, see
+    ``_DATA_ARGUMENT_FLAG_VALUES``) get the same treatment — only the
+    flagged value is masked, everything else in the segment is preserved.
     Strictly fail-closed: masking is skipped (leaving the original,
     regex-matching text in place) whenever the line pipes into a shell or
     interpreter, any argument carries an execution-capable marker
@@ -292,18 +366,29 @@ def _mask_data_sink_arguments(text: str) -> str:
             if not segment:
                 continue
             index = _command_token_index(segment)
-            if index is not None and Path(segment[index]).name in _DATA_SINK_EXECUTABLES:
-                arguments = segment[index + 1 :]
-                if not any(
-                    argument.startswith(".")
-                    or any(marker in argument for marker in _UNSAFE_DATA_ARG_MARKERS)
-                    for argument in arguments
-                ):
-                    changed = True
-                    rebuilt.extend(segment[: index + 1])
-                    rebuilt.extend("arg" for _ in arguments)
-                    continue
-            rebuilt.extend(segment)
+            masked_segment = None
+            if index is not None:
+                executable = Path(segment[index]).name
+                if executable in _DATA_SINK_EXECUTABLES:
+                    # Position-based data sinks: the data occupies the whole
+                    # trailing argument position. Mask all of it unless any
+                    # argument could smuggle execution back in (fail closed).
+                    arguments = segment[index + 1 :]
+                    if not any(
+                        argument.startswith(".")
+                        or any(marker in argument for marker in _UNSAFE_DATA_ARG_MARKERS)
+                        for argument in arguments
+                    ):
+                        masked_segment = segment[: index + 1] + ["arg"] * len(arguments)
+                else:
+                    # Flag-valued data shapes (git commit -m): mask only the
+                    # known data flag's VALUE; everything else is preserved.
+                    masked_segment = _mask_flag_data_values(segment, index)
+            if masked_segment is None:
+                rebuilt.extend(segment)
+                continue
+            changed = True
+            rebuilt.extend(masked_segment)
         lines_out.append(" ".join(rebuilt))
     if not changed:
         return text
@@ -314,9 +399,9 @@ def _lifecycle_command_scan_with_data_exemption(text: str) -> bool:
     """Lifecycle-regex scan that exempts matches living inside data arguments.
 
     Two-pass: the cheap regex first (the overwhelmingly common no-match case
-    pays nothing extra); on a raw match, re-scan with data-sink arguments
-    masked out. Only a match that survives masking — i.e. one in actual
-    command position — blocks.
+    pays nothing extra); on a raw match, re-scan with data arguments masked
+    out (position-based data sinks AND flag-valued data shapes). Only a match
+    that survives masking — i.e. one in actual command position — blocks.
     """
     if not contains_gateway_lifecycle_command(text):
         return False
