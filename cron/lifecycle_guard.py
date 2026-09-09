@@ -653,11 +653,35 @@ def _lifecycle_command_scan_with_data_exemption(text: str) -> bool:
     pays nothing extra); on a raw match, re-scan with data arguments masked
     out (position-based data sinks AND flag-valued data shapes). Only a match
     that survives masking — i.e. one in actual command position — blocks.
+
+    The masker is treated as arbitrary code that may raise at any point: it
+    tokenizes arbitrary text, and a partially written module can even lack
+    ``_UNSAFE_DATA_ARG_MARKERS`` (or the masker function itself). A masker
+    failure may only forfeit the data-exemption — never the scan itself —
+    so it degrades to the plain-regex verdict over the SAME text, which can
+    only over-block (fail closed), never under-block. This containment is
+    what keeps a masker crash from discarding the referenced-script walk in
+    ``contains_gateway_lifecycle_command_or_referenced_script``.
     """
     if not contains_gateway_lifecycle_command(text):
         return False
     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
-    return contains_gateway_lifecycle_command(_mask_data_sink_arguments(normalized))
+    try:
+        masked = _mask_data_sink_arguments(normalized)
+    except Exception:
+        # Masker failure (including NameError on a missing module-level
+        # constant, or the masker function itself being absent — the
+        # reference executes inside this try). The raw regex already
+        # matched above, so the plain-regex verdict is True: log and fail
+        # closed rather than letting the exemption pass silently discard
+        # the scan.
+        logger.warning(
+            "lifecycle guard data-argument masker failed; "
+            "falling back to the plain-regex verdict (fail closed)",
+            exc_info=True,
+        )
+        return contains_gateway_lifecycle_command(normalized)
+    return contains_gateway_lifecycle_command(masked)
 
 
 def _direct_lifecycle_scan(command: str) -> bool:

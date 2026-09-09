@@ -1018,6 +1018,31 @@ class TestLifecycleGuardModule:
             "echo hello"
         ) is False
 
+    def test_masker_crash_does_not_discard_referenced_script_walk(
+        self, monkeypatch, tmp_path
+    ):
+        """A crash inside the data-argument masker must not discard the
+        referenced-script walk: the walk degrades to the plain-regex verdict
+        over the SAME text, so a bare lifecycle command inside a referenced
+        script still blocks (fail closed). Pre-fix, the masker crash was
+        lumped into the walk-infrastructure fallback, which scanned only the
+        top-level command and let the script through."""
+        import cron.lifecycle_guard as lg
+
+        def _boom(*args, **kwargs):
+            raise NameError("_UNSAFE_DATA_ARG_MARKERS is missing (partial write)")
+
+        monkeypatch.setattr(lg, "_mask_data_sink_arguments", _boom)
+        script = tmp_path / "restart.sh"
+        script.write_text(
+            "#!/bin/bash\nsleep 45\nhermes gateway restart\n", encoding="utf-8"
+        )
+        # The top-level command is benign; only the referenced script is
+        # unsafe, so a True verdict can only come from the script walk.
+        assert lg.contains_gateway_lifecycle_command_or_referenced_script(
+            f"/bin/bash {script}", cwd=str(tmp_path)
+        ) is True
+
     def test_cron_guard_total_when_home_unresolvable(self, monkeypatch):
         """`get_hermes_home()` falls back to Path.home(), which raises
         RuntimeError when neither HERMES_HOME nor HOME resolves
