@@ -165,28 +165,32 @@ _PIPE_TO_INTERPRETER = re.compile(
 # lifecycle prose.
 #
 # Mapping: executable (matched by basename, so `sudo hermes …` resolves to
-# `sudo` and stays blocked) -> {subcommand PATH: data flags whose VALUE is data}.
-# A subcommand PATH is a tuple of the leading argument tokens; the DEEPEST
-# matching prefix wins when resolving (see `_mask_flag_data_values`), so git's
-# single-level `("commit",)` and hermes' two-level `("kanban", <verb>)` paths
-# resolve the same way. Only the VALUE of one of these flags is masked; every
-# other token is preserved (fail-closed default). Deliberately conservative:
-# only executables/verbs/flags that carry free-text DATA and have no execution
-# escapes here.
+# `sudo` and stays blocked) -> a nested data-flag table. Each value is EITHER a
+# frozenset of flag names (a leaf: these flags' VALUE args are data at this
+# subcommand level) OR a dict {subcommand token: next level}.
+# `_mask_flag_data_values` walks the dict levels by consuming the leading
+# argument tokens until it reaches a frozenset leaf, so git's single-level
+# `commit` subcommand and hermes' two-level `kanban <verb>` subcommands both
+# resolve to their flag set. Only the VALUE of one of these flags is masked;
+# every other token is preserved (fail-closed default). Deliberately
+# conservative: only executables/verbs/flags that carry free-text DATA and have
+# no execution escapes here.
 #
 # Multi-paragraph QUOTED flag values (a `-m` message spanning physical lines)
 # are joined into one data token before the per-line walk by
 # `_prejoin_open_quote_spans`; an unclosed quote there fails closed and keeps
 # blocking.
-_DATA_ARGUMENT_FLAG_VALUES: dict[str, dict[tuple[str, ...], frozenset[str]]] = {
+_DATA_ARGUMENT_FLAG_VALUES: dict[str, object] = {
     "git": {
-        ("commit",): frozenset({"-m", "--message", "-am"}),
+        "commit": frozenset({"-m", "--message", "-am"}),
     },
     "hermes": {
-        ("kanban", "complete"): frozenset({"--summary", "--result"}),
-        ("kanban", "comment"): frozenset({"--body"}),
-        ("kanban", "create"): frozenset({"--body"}),
-        ("kanban", "edit"): frozenset({"--summary", "--result"}),
+        "kanban": {
+            "complete": frozenset({"--summary", "--result"}),
+            "comment": frozenset({"--body"}),
+            "create": frozenset({"--body"}),
+            "edit": frozenset({"--summary", "--result"}),
+        },
     },
 }
 
@@ -255,9 +259,10 @@ def _mask_flag_data_values(
     Some executables carry DATA in a specific FLAG's value argument rather than
     in the whole trailing-argument position. Only the value of a known data
     flag is masked; every other token passes through untouched. The flag map
-    keys on the leading SUBCOMMAND PATH (a tuple of leading argument tokens);
-    the DEEPEST matching prefix wins, so git's single-level paths and hermes'
-    two-level ``kanban <verb>`` paths both resolve. Returns None when no
+    keys the executable (matched by basename) to a nested table: a dict level
+    consumes the next leading argument token as the subcommand key, walked
+    until a frozenset leaf is reached — so git's single-level ``commit`` and
+    hermes' two-level ``kanban <verb>`` paths both resolve. Returns None when no
     masking applies or the segment fails closed (an unsafe execution-capable
     marker anywhere in the segment, or a known flag with a missing value), so
     the caller keeps the original text — masking can only ever ALLOW, never
@@ -266,21 +271,25 @@ def _mask_flag_data_values(
     arguments = segment[command_index + 1 :]
     if not arguments:
         return None
-    flag_map = _DATA_ARGUMENT_FLAG_VALUES.get(Path(segment[command_index]).name)
-    if flag_map is None:
+    node: object = _DATA_ARGUMENT_FLAG_VALUES.get(Path(segment[command_index]).name)
+    if node is None:
         return None
-    max_depth = max((len(path) for path in flag_map), default=0)
-    flag_path: Optional[tuple[str, ...]] = None
-    for depth in range(min(len(arguments), max_depth), 0, -1):
-        candidate = tuple(arguments[:depth])
-        if candidate in flag_map:
-            flag_path = candidate
-            break
-    if flag_path is None:
-        return None
-    flags = flag_map[flag_path]
-    remaining = arguments[len(flag_path) :]
-    rebuilt: list[str] = list(flag_path)
+    # Walk the nested subcommand levels: a dict level consumes the next
+    # leading argument token as its key; a frozenset leaf is the flag set.
+    # A dict level with no more argument tokens, or an argument token absent
+    # from the dict, means this shape has no flag table — leave unmasked.
+    consumed = 0
+    while isinstance(node, dict):
+        if consumed >= len(arguments):
+            return None
+        child = node.get(arguments[consumed])
+        if child is None:
+            return None
+        node = child
+        consumed += 1
+    flags = node  # frozenset leaf
+    remaining = arguments[consumed:]
+    rebuilt: list[str] = list(arguments[:consumed])
     masked = False
     i = 0
     while i < len(remaining):

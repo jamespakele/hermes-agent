@@ -1373,6 +1373,31 @@ class TestLifecycleGuardGitCommitFlagExemption:
 
     def test_plain_commit_message_without_phrase_unaffected(self):
         assert self._scan('git commit -m "fix the flaky test"') is False
+    def test_git_commit_flag_map_unchanged(self):
+        from cron.lifecycle_guard import _DATA_ARGUMENT_FLAG_VALUES
+        assert _DATA_ARGUMENT_FLAG_VALUES["git"]["commit"] == frozenset(
+            {"-m", "--message", "-am"}
+        )
+
+    def test_multiline_commit_message_single_quote_span_not_blocked(self):
+        """Task (a) mechanics: single-quote spans join the same as double."""
+        command = (
+            "git commit -m 'para one\n\n"
+            "hermes gateway stop rationale"
+            "'"
+        )
+        assert self._scan(command) is False
+
+    def test_multiline_commit_message_conflicting_quote_still_blocked(self):
+        """Fail closed: a double quote opened on line one that a later
+        single-quoted line can never close is ambiguous quoting — no
+        pre-join; the quoted prose still blocks."""
+        command = (
+            'git commit -m "para one\n'
+            "'hermes gateway restart'\n"
+            "still open"
+        )
+        assert self._scan(command) is True
 
     def test_multiline_commit_message_prose_not_blocked(self):
         """A quoted -m value spanning physical lines is joined into one data
